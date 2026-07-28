@@ -14,17 +14,15 @@ A single read-only PowerShell script that surveys a forest, scores every privile
 &nbsp;
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-[Features](#what-it-checks) · [Screenshots](#screenshots) · [Quick start](#quick-start) · [Verification](#post-enrolment-verification) · [Limitations](#limitations--notes)
+[Features](#what-it-checks) · [Quick start](#quick-start) · [Verification](#post-enrolment-verification) · [Limitations](#limitations--notes)
+
+<br>
+
+<img src="screenshots/report.png" alt="ADPU-Analyzer readiness report" width="840">
+
+<sub>The readiness walkthrough: bottom line first, then the accounts that are clear to enrol — each with the evidence behind the verdict and a ready-to-run command.</sub>
 
 </div>
-
-```
-   _   ___  ___ _   _      _             _
-  /_\ |   \| _ \ | | |___ /_\  _ _  __ _| |_  _ ______ _ _
- / _ \| |) |  _/ |_| |___/ _ \| ' \/ _` | | || |_ / -_) '_|
-/_/ \_\___/|_|  \___/   /_/ \_\_||_\__,_|_|\_, /__\___|_|
-                                           |__/
-```
 
 ---
 
@@ -41,7 +39,6 @@ The *Protected Users* group hardens its members against common credential attack
 
 - [What it checks](#what-it-checks)
 - [How the verdict works](#how-the-verdict-works)
-- [Screenshots](#screenshots)
 - [Requirements](#requirements)
 - [Auditing prerequisites](#auditing-prerequisites)
 - [Quick start](#quick-start)
@@ -86,22 +83,6 @@ Every pending account ends up in one of two lists, and **both are itemised** —
 
 > [!IMPORTANT]
 > The NTLM and Kerberos checks are **backward-looking**. They see what is in the current event logs, and only where logon auditing was enabled. An account that simply has not used NTLM *recently* looks identical to one that never will.
-
----
-
-## Screenshots
-
-![Readiness report](screenshots/screenshot-report.png)
-
-*The readiness walkthrough: bottom line first, then the accounts that are clear to enrol — each with the evidence behind the verdict and a ready-to-run command.*
-
-![Blocked accounts](screenshots/screenshot-blocked.png)
-
-*Blocked accounts list only what is holding them back — legacy authentication, cipher configuration, or an account type that does not belong in the group.*
-
-![Post-enrolment verification](screenshots/screenshot-verify.png)
-
-*`-Verify` reads the dedicated Protected Users channels after enrolling: who is still being turned away, and where a channel is switched off and recorded nothing.*
 
 ---
 
@@ -232,7 +213,7 @@ The tool flags **known blockers** from the evidence available; it cannot guarant
 README.md                 this file
 LICENSE                   MIT
 ADPU-Analyzer.ps1         the whole tool (single file, read-only)
-screenshots/              images used in this README
+screenshots/              image used in this README
 ```
 
 ## License
