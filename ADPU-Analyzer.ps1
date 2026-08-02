@@ -8,6 +8,8 @@
 #    .\ADPU-Analyzer.ps1                         run it; pick a domain when asked
 #    . .\ADPU-Analyzer.ps1 ; Invoke-ADPUAnalyzer -Domain corp.example.net
 #    . .\ADPU-Analyzer.ps1 ; Invoke-ADPUAnalyzer -HtmlPath .\report.html
+#    . .\ADPU-Analyzer.ps1 ; Invoke-ADPUAnalyzer -Days 30
+#                                                widen the Security-log window
 #    . .\ADPU-Analyzer.ps1 ; Invoke-ADPUAnalyzer -Verify -Days 7
 #                                                after enrolling: read the
 #                                                Protected Users operational logs
@@ -202,6 +204,7 @@ function Start-ADPUActivity {
 
     $spin = '|','/','-','\'
     $n = 0
+    $result = $null
     try {
         while (-not $async.IsCompleted) {
             Write-Host ("`r {0} {1}..." -f $spin[$n % $spin.Length], $Caption) -NoNewline -ForegroundColor Cyan
@@ -212,9 +215,21 @@ function Start-ADPUActivity {
     } finally {
         $done = ('[Info]'.PadRight(8) + " $Caption... done.")
         Write-Host ("`r{0}" -f $done.PadRight($Caption.Length + 18)) -ForegroundColor Cyan
+        # Errors raised inside the side runspace are invisible otherwise - they do
+        # not reach the caller's error stream. Surface them under -Verbose so a
+        # silent empty result can be told apart from a genuine "nothing found".
+        try {
+            foreach ($err in $shell.Streams.Error) {
+                Write-Verbose ("{0}: {1}" -f $Caption, $err.Exception.Message)
+            }
+        } catch { }
         $shell.Dispose()
     }
-    $result
+
+    # EndInvoke hands back a PSDataCollection, so a single returned value would
+    # arrive as a one-element collection and every caller would have to unwrap it.
+    if ($null -eq $result) { return }
+    if ($result.Count -eq 1) { $result[0] } else { $result }
 }
 
 function Show-ADPUBanner {
@@ -303,8 +318,14 @@ function Expand-ADPUGroup {
         [Parameter(Mandatory)] $Domain
     )
 
-    $ctx   = [DirectoryServices.AccountManagement.PrincipalContext]::new('Domain', $Domain.Name)
-    $group = [DirectoryServices.AccountManagement.GroupPrincipal]::FindByIdentity($ctx, [string]$GroupSid)
+    try {
+        $ctx   = [DirectoryServices.AccountManagement.PrincipalContext]::new('Domain', $Domain.Name)
+        $group = [DirectoryServices.AccountManagement.GroupPrincipal]::FindByIdentity($ctx, [string]$GroupSid)
+    } catch {
+        # FindByIdentity contacts a controller - an unreachable domain throws here.
+        Write-ADPULine warn "Could not look up group $GroupSid in $($Domain.Name)."
+        return
+    }
 
     if (-not $group) {
         Write-ADPULine warn "Group $GroupSid is absent in $($Domain.Name) - nothing to expand."
@@ -365,10 +386,10 @@ function Test-ADPURemoting {
     [CmdletBinding()]
     param([Parameter(Mandatory)] $Controller)
 
-    Start-ADPUActivity "Checking WinRM on $($Controller.Name)" -With $Controller -Work {
+    Start-ADPUActivity "Checking WinRM on $($Controller.Name)" -With ([string]$Controller.Name) -Work {
         param($box)
-        $null = Test-WSMan -ComputerName $box -ErrorAction SilentlyContinue
-        $?
+        # $? after an assignment is fragile - be explicit instead.
+        try { $null = Test-WSMan -ComputerName $box -ErrorAction Stop; $true } catch { $false }
     }
 }
 
@@ -391,34 +412,81 @@ function Test-ADPUAuditReady {
     [CmdletBinding()]
     param([Parameter(Mandatory)] $Controller)
 
-    Start-ADPUActivity "Reading audit policy on $($Controller.Name)" -With $Controller -Work {
+    Start-ADPUActivity "Reading audit policy on $($Controller.Name)" -With ([string]$Controller.Name) -Work {
         param($box)
         Invoke-Command -ComputerName $box -ScriptBlock {
 
-            function Get-ADPUAuditSetting {
-                param([string]$Guid)
-                $csv = New-TemporaryFile
-                try {
-                    auditpol /get /subcategory:"$Guid" /r | Out-File -FilePath $csv -Force
-                    $row = Import-Csv -Path $csv |
-                           Where-Object { $_.'Policy Target' -eq 'System' } |
-                           Select-Object -First 1
-                    if ($row) { [string]$row.'Inclusion Setting' } else { $null }
-                } catch {
-                    $null
-                } finally {
-                    Remove-Item $csv -ErrorAction SilentlyContinue
+            <#
+                auditpol is fully localised - column headers and the "Inclusion
+                Setting" text ("Success" / "Erfolg" / ...) both change with the
+                system language, and `/get /r` carries no numeric column at all.
+                `/backup` does: its last column is the raw setting value
+                (0 = none, 1 = success, 2 = failure, 3 = both). So the backup CSV
+                is parsed positionally with our own header names and the rows are
+                found by their GUID column, which is language-neutral.
+            #>
+            $cols = 'MachineName','PolicyTarget','Subcategory','SubcategoryGuid',
+                    'InclusionSetting','ExclusionSetting','SettingValue'
+            $rows = @()
+            $tmp  = Join-Path $env:TEMP ("adpu-audit-{0}.csv" -f [guid]::NewGuid())
+            try {
+                $null = auditpol /backup /file:"$tmp"
+                if (Test-Path -LiteralPath $tmp) {
+                    $rows = @(Get-Content -LiteralPath $tmp |
+                              Where-Object { $_ -and $_.Trim() } |
+                              ConvertFrom-Csv -Header $cols)
                 }
+            } catch {
+            } finally {
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
             }
 
-            $logonSetting = Get-ADPUAuditSetting '{0CCE9215-69AE-11D9-BED3-505054503030}'
-            $kerbSetting  = Get-ADPUAuditSetting '{0CCE9242-69AE-11D9-BED3-505054503030}'
+            function Get-ADPUAuditSetting {
+                param([string]$Guid, [object[]]$Rows)
+                $bare = $Guid.Trim('{','}')
+                $row  = $Rows |
+                        Where-Object { ([string]$_.SubcategoryGuid).Trim('{','}') -eq $bare } |
+                        Select-Object -First 1
+                if (-not $row) { return @{ Value = $null; Text = $null } }
+                $n = 0
+                $val = if ([int]::TryParse([string]$row.SettingValue, [ref]$n)) { $n } else { $null }
+                @{ Value = $val; Text = [string]$row.InclusionSetting }
+            }
+
+            $logon = Get-ADPUAuditSetting '{0CCE9215-69AE-11D9-BED3-505054503030}' $rows
+            $kerb  = Get-ADPUAuditSetting '{0CCE9242-69AE-11D9-BED3-505054503030}' $rows
+
+            # Last resort if /backup produced nothing (rights, odd build): fall
+            # back to the localised text of `/get /r`. This only understands
+            # English output - on other languages it stays "unknown", which the
+            # report treats as "off" and flags loudly, rather than pretending.
+            if ($null -eq $logon.Value -and $null -eq $kerb.Value) {
+                function Get-ADPUAuditText {
+                    param([string]$Guid)
+                    try {
+                        $row = auditpol /get /subcategory:"$Guid" /r |
+                               Where-Object { $_ -and $_.Trim() } |
+                               ConvertFrom-Csv -Header 'MachineName','PolicyTarget','Subcategory','SubcategoryGuid','InclusionSetting','ExclusionSetting' |
+                               Where-Object { ([string]$_.SubcategoryGuid).Trim('{','}') -eq $Guid.Trim('{','}') } |
+                               Select-Object -First 1
+                        if ($row) { [string]$row.InclusionSetting } else { $null }
+                    } catch { $null }
+                }
+                $lgTxt = Get-ADPUAuditText '{0CCE9215-69AE-11D9-BED3-505054503030}'
+                $kbTxt = Get-ADPUAuditText '{0CCE9242-69AE-11D9-BED3-505054503030}'
+                if ($lgTxt -match 'Success') { $logon = @{ Value = 1; Text = $lgTxt } } elseif ($lgTxt) { $logon = @{ Value = $null; Text = $lgTxt } }
+                if ($kbTxt -match 'Success') { $kerb  = @{ Value = 1; Text = $kbTxt } } elseif ($kbTxt) { $kerb  = @{ Value = $null; Text = $kbTxt } }
+            }
 
             [pscustomobject]@{
-                Logon        = [bool]($logonSetting -match 'Success')
-                Kerberos     = [bool]($kerbSetting  -match 'Success')
-                LogonSetting = if ($logonSetting) { $logonSetting } else { 'unknown' }
-                KerbSetting  = if ($kerbSetting)  { $kerbSetting }  else { 'unknown' }
+                # bit 0 = success auditing, which is what 4624/4768 need.
+                Logon        = ($null -ne $logon.Value) -and (($logon.Value -band 1) -ne 0)
+                Kerberos     = ($null -ne $kerb.Value)  -and (($kerb.Value  -band 1) -ne 0)
+                # "could not be read" is not the same as "switched off" - keep them apart.
+                LogonKnown   = ($null -ne $logon.Value)
+                KerbKnown    = ($null -ne $kerb.Value)
+                LogonSetting = if ($logon.Text) { $logon.Text } else { 'unknown' }
+                KerbSetting  = if ($kerb.Text)  { $kerb.Text }  else { 'unknown' }
             }
         }
     }
@@ -427,49 +495,99 @@ function Test-ADPUAuditReady {
 function Get-ADPUSuspectLogons {
     <#
         Harvests the logon events that matter for Protected Users from a controller's
-        Security log. -Flavor NTLM grabs 4624 logons that used NTLM; -Flavor WeakKerb
-        grabs 4768 TGTs issued with DES/RC4 (i.e. anything that is not AES or the
-        sentinel 0xFFFFFFFF). Each event carries a rendered .Detail string.
+        Security log, over the last -Days days. -Flavor NTLM grabs 4624 logons that
+        used NTLM; -Flavor WeakKerb grabs 4768 TGTs issued with DES/RC4 (i.e. anything
+        that is not AES or the sentinel used on failed requests).
+
+        The aggregation happens on the controller: only one row per distinct SID comes
+        back (.Sid, .Account, .Count, .Last). Shipping whole EventRecord objects - and
+        calling FormatDescription() on each of them - is what made this the slowest
+        part of the run on a busy DC, and the rendered text was never a safe thing to
+        match a SID against anyway.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] $Controller,
-        [Parameter(Mandatory)][ValidateSet('NTLM', 'WeakKerb')] [string]$Flavor
+        [Parameter(Mandatory)][ValidateSet('NTLM', 'WeakKerb')] [string]$Flavor,
+        [int]$Days = 7
     )
 
     $caption = if ($Flavor -eq 'NTLM') {
-        "Sweeping $($Controller.Name) for NTLM logons"
+        "Sweeping $($Controller.Name) for NTLM logons (last $Days d)"
     } else {
-        "Sweeping $($Controller.Name) for DES/RC4 Kerberos"
+        "Sweeping $($Controller.Name) for DES/RC4 Kerberos (last $Days d)"
     }
 
-    Start-ADPUActivity $caption -With $Controller, $Flavor -Work {
-        param($box, $flavor)
-        Invoke-Command -ComputerName $box -ArgumentList $flavor -ScriptBlock {
-            param($flavor)
+    Start-ADPUActivity $caption -With ([string]$Controller.Name), $Flavor, $Days -Work {
+        param($box, $flavor, $days)
+        Invoke-Command -ComputerName $box -ArgumentList $flavor, $days -ScriptBlock {
+            param($flavor, $days)
+
+            $span = [int64]$days * 86400000
+
             if ($flavor -eq 'NTLM') {
-                $filter = @"
-                    *[EventData[Data[@Name='AuthenticationPackageName'] and (Data='NTLM')]]
-                    [System[(EventID=4624)]]
-"@
+                # Compare the named field directly - the looser two-clause form
+                # ("has the field, and any Data equals NTLM") could match on a
+                # different field that happens to hold the same text.
+                $filter = "*[EventData[Data[@Name='AuthenticationPackageName']='NTLM']]" +
+                          "[System[(EventID=4624) and TimeCreated[timediff(@SystemTime) <= $span]]]"
+                $sidField  = 'TargetUserSid'
+                $nameField = 'TargetUserName'
             } else {
-                $filter = @"
-                    *[EventData
-                        [Data[@Name='TicketEncryptionType']!='0x12']
-                        [Data[@Name='TicketEncryptionType']!='0x11']
-                        [Data[@Name='TicketEncryptionType']!='0xFFFFFFFF']]
-                    [System[(EventID=4768)]]
-"@
+                # 0x11/0x12 are AES128/AES256; 0xffffffff is the sentinel on failed
+                # requests. Event XPath compares case-sensitively and Windows renders
+                # the sentinel in lower case, so both spellings are excluded.
+                $filter = "*[EventData" +
+                          "[Data[@Name='TicketEncryptionType']!='0x12']" +
+                          "[Data[@Name='TicketEncryptionType']!='0x11']" +
+                          "[Data[@Name='TicketEncryptionType']!='0xffffffff']" +
+                          "[Data[@Name='TicketEncryptionType']!='0xFFFFFFFF']]" +
+                          "[System[(EventID=4768) and TimeCreated[timediff(@SystemTime) <= $span]]]"
+                $sidField  = 'TargetSid'
+                $nameField = 'TargetUserName'
             }
-            $q = [Diagnostics.Eventing.Reader.EventLogQuery]::new('Security', 'LogName', $filter)
-            $r = [Diagnostics.Eventing.Reader.EventLogReader]::new($q)
+
+            try {
+                $q = [Diagnostics.Eventing.Reader.EventLogQuery]::new('Security', 'LogName', $filter)
+                $r = [Diagnostics.Eventing.Reader.EventLogReader]::new($q)
+            } catch {
+                return                      # log unreadable (rights, bad filter)
+            }
+
+            $seen = @{}
             try {
                 while ($null -ne ($e = $r.ReadEvent())) {
-                    $e | Add-Member -NotePropertyName Detail -NotePropertyValue $e.FormatDescription() -Force -PassThru
+                    try {
+                        $data = @(([xml]$e.ToXml()).Event.EventData.Data)
+                        # .Name on an XmlElement is the element name, not the
+                        # attribute - GetAttribute is the only correct read here.
+                        $sidNode  = $data | Where-Object { $_.GetAttribute('Name') -eq $sidField }  | Select-Object -First 1
+                        $nameNode = $data | Where-Object { $_.GetAttribute('Name') -eq $nameField } | Select-Object -First 1
+                        $sid = if ($sidNode) { [string]$sidNode.InnerText } else { $null }
+
+                        if ($sid -and $sid -ne 'S-1-0-0') {
+                            if ($seen.ContainsKey($sid)) {
+                                $seen[$sid].Count++
+                                if ($e.TimeCreated -gt $seen[$sid].Last) { $seen[$sid].Last = $e.TimeCreated }
+                            } else {
+                                $seen[$sid] = [pscustomobject]@{
+                                    Sid     = $sid
+                                    Account = if ($nameNode) { [string]$nameNode.InnerText } else { '' }
+                                    Count   = 1
+                                    Last    = $e.TimeCreated
+                                }
+                            }
+                        }
+                    } catch { }
+                    $e.Dispose()
                 }
             } catch {
                 # reading past the end / access trouble: stop quietly
+            } finally {
+                try { $r.Dispose() } catch { }
             }
+
+            $seen.Values
         }
     }
 }
@@ -504,7 +622,7 @@ function Get-ADPUProtectedUserEvents {
     # the argument list and shift everything after it.
     $idPart = ($ids | ForEach-Object { "EventID=$_" }) -join ' or '
 
-    Start-ADPUActivity "Reading protected-user $($Flavor.ToLowerInvariant()) on $($Controller.Name)" -With $Controller, $log, $idPart, $Days -Work {
+    Start-ADPUActivity "Reading protected-user $($Flavor.ToLowerInvariant()) on $($Controller.Name)" -With ([string]$Controller.Name), $log, $idPart, $Days -Work {
         param($box, $log, $idPart, $days)
         Invoke-Command -ComputerName $box -ArgumentList $log, $idPart, $days -ScriptBlock {
             param($log, $idPart, $days)
@@ -558,14 +676,11 @@ function Get-ADPUProtectedUserEvents {
 #  >> Environment sweep (build the annotated topology)
 #  ==========================================================================
 
-# Server builds new enough to honour Protected Users on a DC.
-$script:ADPUModernServers = @(
-    'Windows Server 2025 Standard',   'Windows Server 2025 Datacenter'
-    'Windows Server 2022 Standard',   'Windows Server 2022 Datacenter'
-    'Windows Server 2019 Standard',   'Windows Server 2019 Datacenter'
-    'Windows Server 2016 Standard',   'Windows Server 2016 Datacenter'
-    'Windows Server 2012 R2 Standard','Windows Server 2012 R2 Datacenter'
-)
+# Server builds new enough to honour Protected Users on a DC: 2012 R2 and up.
+# A fixed list of SKU strings misses Core installs, Evaluation editions and names
+# like "Windows Server 2022 Datacenter: Azure Edition", so match on the release
+# instead. "Windows Server 2012 Standard" (no R2) is deliberately not matched.
+$script:ADPUModernServerPattern = '^Windows Server (2012 R2|201[6-9]|20[2-9]\d)\b'
 
 # Functional-level 6 == Server 2012 R2, the floor for the Protected Users group.
 $script:ADPUFunctionalFloor = 6
@@ -583,10 +698,13 @@ function Get-ADPUTopology {
         .PARAMETER DomainName
             Optional list of domain names to limit the review to. When omitted,
             every reachable domain in the forest is surveyed (the default).
+        .PARAMETER Days
+            How far back the Security-log harvest reaches. Default 7.
     #>
     [CmdletBinding()]
     param(
-        [string[]]$DomainName
+        [string[]]$DomainName,
+        [int]$Days = 7
     )
 
     # -- forest -----------------------------------------------------------------
@@ -610,11 +728,16 @@ function Get-ADPUTopology {
         Write-ADPULine note ("Scope limited to: {0}" -f ($candidateDomains.Name -join ', '))
     }
     $domains = foreach ($d in $candidateDomains) {
-        if (-not ($d.Forest -and $d.DomainControllers)) {
+        # An unreachable domain does not return $null here - the property getter
+        # throws, which used to abort the whole run instead of skipping the domain.
+        try {
+            $null = $d.Forest
+            $null = $d.DomainControllers
+            $sid  = Get-ADPUDomainSid -DomainName $d.Name
+        } catch {
             Write-ADPULine warn "$($d.Name) is out of reach - leaving it out of the review."
             continue
         }
-        $sid     = Get-ADPUDomainSid -DomainName $d.Name
         $pugSid  = [Security.Principal.SecurityIdentifier]::new("$sid-525")
         $present = Test-ADPUPugPresent -Domain $d -PugSid $pugSid
         $bornOn  = if ($present) { Get-ADPUPugTimestamp -Domain $d -PugSid $pugSid } else { $null }
@@ -635,15 +758,30 @@ function Get-ADPUTopology {
     # -- controllers ------------------------------------------------------------
     Write-ADPULine note 'Reaching the controllers...'
     $controllers = foreach ($d in $domains) {
-        $ctx = [DirectoryServices.ActiveDirectory.DirectoryContext]::new(0, $d.Name)
-        foreach ($dc in [DirectoryServices.ActiveDirectory.DomainController]::FindAll($ctx)) {
-            if (-not ($dc.Forest -and $dc.Domain)) {
+        try {
+            $ctx    = [DirectoryServices.ActiveDirectory.DirectoryContext]::new(0, $d.Name)
+            $dcList = @([DirectoryServices.ActiveDirectory.DomainController]::FindAll($ctx))
+        } catch {
+            Write-ADPULine warn "Could not enumerate the controllers of $($d.Name) - skipping them."
+            continue
+        }
+
+        foreach ($dc in $dcList) {
+            try {
+                $null = $dc.Forest
+                $null = $dc.Domain
+            } catch {
                 Write-ADPULine warn "$($dc.Name) is out of reach - leaving it out of the review."
                 continue
             }
 
-            $dc | Add-Member -NotePropertyName OSOk    -NotePropertyValue ([bool]($script:ADPUModernServers -contains [string]$dc.OSVersion)) -Force
-            $dc | Add-Member -NotePropertyName WinRMUp -NotePropertyValue (Test-ADPURemoting -Controller $dc) -Force
+            # DomainController.Domain is a Domain object, so comparing it to a domain
+            # name string never matches. Stamp the name once, here, and filter on that.
+            $dc | Add-Member -NotePropertyName DomainName -NotePropertyValue ([string]$d.Name) -Force
+            $dc | Add-Member -NotePropertyName OSOk    -NotePropertyValue ([bool]([string]$dc.OSVersion -match $script:ADPUModernServerPattern)) -Force
+            $dc | Add-Member -NotePropertyName WinRMUp -NotePropertyValue ([bool](Test-ADPURemoting -Controller $dc)) -Force
+            $dc | Add-Member -NotePropertyName NtlmHits     -NotePropertyValue @() -Force
+            $dc | Add-Member -NotePropertyName WeakKerbHits -NotePropertyValue @() -Force
 
             if (-not $dc.WinRMUp) {
                 $dc | Add-Member -NotePropertyName AuditLogonOk -NotePropertyValue $false -Force
@@ -668,16 +806,31 @@ function Get-ADPUTopology {
                 # Each subcategory feeds exactly one harvest. Collecting an event
                 # type whose auditing is off would return an empty set that later
                 # reads as "nothing found" instead of "nothing recorded".
+                # A failure here (access denied, log corruption) used to abort the
+                # entire run; it must only cost this one controller's evidence.
                 if ($auditLogon) {
-                    $dc | Add-Member -NotePropertyName NtlmHits -NotePropertyValue (Get-ADPUSuspectLogons -Controller $dc -Flavor NTLM) -Force
+                    try {
+                        $dc | Add-Member -NotePropertyName NtlmHits -NotePropertyValue @(Get-ADPUSuspectLogons -Controller $dc -Flavor NTLM -Days $Days) -Force
+                    } catch {
+                        Write-ADPULine warn "Could not read the Security log on $($dc.Name) for NTLM: $($_.Exception.Message)"
+                        $dc.AuditLogonOk = $false
+                    }
                 } else {
                     Write-ADPULine warn "Logon auditing is off on $($dc.Name) - no NTLM evidence from this controller."
                 }
                 if ($auditKerb) {
-                    $dc | Add-Member -NotePropertyName WeakKerbHits -NotePropertyValue (Get-ADPUSuspectLogons -Controller $dc -Flavor WeakKerb) -Force
+                    try {
+                        $dc | Add-Member -NotePropertyName WeakKerbHits -NotePropertyValue @(Get-ADPUSuspectLogons -Controller $dc -Flavor WeakKerb -Days $Days) -Force
+                    } catch {
+                        Write-ADPULine warn "Could not read the Security log on $($dc.Name) for Kerberos: $($_.Exception.Message)"
+                        $dc.AuditKerbOk = $false
+                    }
                 } else {
                     Write-ADPULine warn "Kerberos Authentication Service auditing is off on $($dc.Name) - no DES/RC4 evidence from this controller."
                 }
+                # A failed harvest above may have withdrawn a subcategory - keep
+                # the summary flag consistent with the final per-subcategory state.
+                $dc.AuditOk = ($dc.AuditLogonOk -or $dc.AuditKerbOk)
             }
             $dc
         }
@@ -702,8 +855,11 @@ function Get-ADPUTopology {
         $forestAdmins = @()
     }
 
+    # DNs are compared case-insensitively - AD itself does not treat their case
+    # as significant, and an ordinal set would let the same account through twice.
     $seen = [System.Collections.Generic.HashSet[string]]::new(
-        [string[]]@($forestAdmins.DistinguishedName | Where-Object { $_ })
+        [string[]]@($forestAdmins.DistinguishedName | Where-Object { $_ }),
+        [System.StringComparer]::OrdinalIgnoreCase
     )
     $domainAdmins = foreach ($d in $domains) {
         foreach ($s in $d.AdminSids) {
@@ -714,11 +870,12 @@ function Get-ADPUTopology {
     }
 
     [pscustomobject]@{
-        Forest      = $forest
-        Domains     = @($domains)
-        Controllers = @($controllers)
-        PugMembers  = @($pugMembers)
-        Admins      = @(@($forestAdmins) + @($domainAdmins))
+        Forest       = $forest
+        Domains      = @($domains)
+        Controllers  = @($controllers)
+        PugMembers   = @($pugMembers)
+        Admins       = @(@($forestAdmins) + @($domainAdmins))
+        LookbackDays = $Days
     }
 }
 
@@ -746,14 +903,26 @@ function Set-ADPUReadiness {
 
     # Fast lookup of who is already in a Protected Users group.
     $enrolledDns = [System.Collections.Generic.HashSet[string]]::new(
-        [string[]]@($Topology.PugMembers.DistinguishedName | Where-Object { $_ })
+        [string[]]@($Topology.PugMembers.DistinguishedName | Where-Object { $_ }),
+        [System.StringComparer]::OrdinalIgnoreCase
     )
 
     # Each event type only counts from controllers whose own subcategory was on.
-    $ntlmSource = $Topology.Controllers | Where-Object { $_.AuditLogonOk }
-    $weakSource = $Topology.Controllers | Where-Object { $_.AuditKerbOk }
-    $ntlmBlob = [string]::Join("`n", @($ntlmSource.NtlmHits.Detail     | Where-Object { $_ }))
-    $weakBlob = [string]::Join("`n", @($weakSource.WeakKerbHits.Detail | Where-Object { $_ }))
+    $ntlmSource = @($Topology.Controllers | Where-Object { $_.AuditLogonOk })
+    $weakSource = @($Topology.Controllers | Where-Object { $_.AuditKerbOk })
+
+    # Exact SID sets rather than a joined blob of rendered event text. A substring
+    # search over that text let ...-1105 match ...-11050, and it also matched SIDs
+    # that only appeared in an event's Subject fields - i.e. a different principal
+    # from the one that actually authenticated.
+    $ntlmSids = [System.Collections.Generic.HashSet[string]]::new(
+        [string[]]@($ntlmSource.NtlmHits.Sid     | Where-Object { $_ }),
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    $weakSids = [System.Collections.Generic.HashSet[string]]::new(
+        [string[]]@($weakSource.WeakKerbHits.Sid | Where-Object { $_ }),
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
 
     $oneYearAgo = (Get-Date).AddDays(-365)
 
@@ -765,9 +934,12 @@ function Set-ADPUReadiness {
         $enrolled    = $enrolledDns.Contains([string]$acct.DistinguishedName)
         $pwdStale    = ($pwdSet -is [datetime]) -and ($pwdSet -lt $oneYearAgo)
         $pwdPreGroup = ($pwdSet -is [datetime]) -and ($bornOn -is [datetime]) -and ($pwdSet -lt $bornOn)
-        $didNtlm     = (-not $enrolled) -and $sidText -and $ntlmBlob.Contains($sidText)
-        $didWeak     = (-not $enrolled) -and $sidText -and $weakBlob.Contains($sidText)
+        $didNtlm     = (-not $enrolled) -and $sidText -and $ntlmSids.Contains($sidText)
+        $didWeak     = (-not $enrolled) -and $sidText -and $weakSids.Contains($sidText)
         $person      = ([string]$acct.StructuralObjectClass) -match 'user|iNetOrgPerson'
+        # No group in the home domain means the enrolment command cannot succeed,
+        # however clean the account itself looks.
+        $noPugHere   = -not [bool]$acct.HomeDomain.PugPresent
 
         # Informational hardening signals - read straight from AD. These never
         # change the enrol verdict; they are surfaced as separate hints only.
@@ -791,9 +963,9 @@ function Set-ADPUReadiness {
             } catch { }
             try {
                 # msDS-SupportedEncryptionTypes bits: 0x1 DES-CRC, 0x2 DES-MD5,
-                # 0x4 RC4, 0x8 AES128, 0x10 AES256. Absent or 0 means "use the
-                # default", which is AES - only an explicitly set value without any
-                # AES bit locks the account out of the group.
+                # 0x4 RC4, 0x8 AES128, 0x10 AES256. Absent or 0 means the OS
+                # default applies, which includes AES - so only an explicitly set
+                # value without any AES bit locks the account out of the group.
                 $raw = $de.Properties['msDS-SupportedEncryptionTypes'].Value
                 if ($null -ne $raw) { $etypes = [int]$raw }
                 $noAesEtype = ($null -ne $etypes) -and ($etypes -ne 0) -and (($etypes -band 0x18) -eq 0)
@@ -801,8 +973,9 @@ function Set-ADPUReadiness {
         } catch { }
 
         $clearNow = $person -and -not $enrolled -and -not $pwdPreGroup -and -not $didNtlm -and -not $didWeak -and
-                    -not $desOnly -and -not $noAesEtype
+                    -not $desOnly -and -not $noAesEtype -and -not $noPugHere
 
+        $acct | Add-Member -NotePropertyName NoPugHere   -NotePropertyValue $noPugHere   -Force
         $acct | Add-Member -NotePropertyName DesOnly     -NotePropertyValue $desOnly     -Force
         $acct | Add-Member -NotePropertyName NoAesEtype  -NotePropertyValue $noAesEtype  -Force
         $acct | Add-Member -NotePropertyName EncTypes    -NotePropertyValue $etypes      -Force
@@ -866,7 +1039,8 @@ function Show-ADPUReadinessReport {
     Write-ADPULine head 'Summary'
     Write-ADPULine sub  'Privileged = inside Administrators, Domain Admins, Enterprise Admins or Schema Admins.'
     Write-ADPULine sub  'Real user accounts belong in Protected Users; computer and service accounts do not.'
-    Write-ADPULine sub  'Clear = a user account with AES-capable keys and no NTLM or DES/RC4 seen in the logs that could be read. Each verdict is itemised below.'
+    $window = if ($Topology.LookbackDays) { [int]$Topology.LookbackDays } else { 7 }
+    Write-ADPULine sub  ('Clear = a user account with AES-capable keys and no NTLM or DES/RC4 in the last {0} day(s) of the logs that could be read. Each verdict is itemised below.' -f $window)
     Write-ADPULine note ("{0} privileged accounts in total." -f @($admins).Count)
     Write-ADPULine note ("{0} already enrolled, {1} still outside the group." -f $enrolled.Count, $pending.Count)
     Write-ADPULine note ("{0} of the {1} pending accounts are clear to enrol right now." -f $clear.Count, $pending.Count)
@@ -912,6 +1086,9 @@ function Show-ADPUReadinessReport {
                 Write-ADPULine bad  '   group managed service account - cannot join Protected Users (nor be marked sensitive); use an authentication policy silo instead, and reconsider its admin rights'
             } elseif (-not $a.Person) {
                 Write-ADPULine bad  '   not a user account (computer/service) - cannot be enrolled; reconsider its admin rights'
+            }
+            if ($a.NoPugHere) {
+                Write-ADPULine bad  '   its home domain has no Protected Users group - create it there first (PDC emulator on 2012 R2+)'
             }
             if ($a.DesOnly) {
                 Write-ADPULine bad  '   "use DES encryption types only" is set (userAccountControl 0x200000) - clear the flag and reset the password'
@@ -991,8 +1168,8 @@ function Show-ADPUReadinessReport {
         }
 
         # its controllers: OS + audit together, indented under the domain
-        $dcs = @($Topology.Controllers | Where-Object { $_.Domain -eq $d.Name })
-        if (-not $dcs) { $dcs = @($Topology.Controllers) }   # fallback if .Domain does not line up
+        $dcs = @($Topology.Controllers | Where-Object { $_.DomainName -eq $d.Name })
+        if (-not $dcs) { Write-ADPULine warn '   no reachable controller in this domain - nothing could be inspected here.' }
         foreach ($dc in $dcs) {
             $osText    = if ($dc.OSOk)         { "OS $($dc.OSVersion) ok" }   else { "OS $($dc.OSVersion) too old" }
             $logonText = if ($dc.AuditLogonOk) { 'logon auditing on' }        else { 'logon auditing OFF (no NTLM evidence)' }
@@ -1162,6 +1339,7 @@ footer{padding:20px 28px 32px;color:#9aa1ad;font-size:12px}
             $badges = [System.Collections.Generic.List[string]]::new()
             if ($a.IsGmsa) { [void]$badges.Add('<span class="badge bad">gMSA - not eligible</span>') }
             elseif (-not $a.Person) { [void]$badges.Add('<span class="badge bad">not a user account</span>') }
+            if ($a.NoPugHere) { [void]$badges.Add('<span class="badge bad">no Protected Users group in this domain</span>') }
             if ($a.DesOnly) { [void]$badges.Add('<span class="badge bad">DES only (UAC 0x200000)</span>') }
             if ($a.NoAesEtype) { [void]$badges.Add(('<span class="badge bad">no AES in msDS-SupportedEncryptionTypes (0x{0:X})</span>' -f [int]$a.EncTypes)) }
             if ($a.PwdPreGroup) { [void]$badges.Add('<span class="badge bad">password predates group</span>') }
@@ -1216,8 +1394,8 @@ footer{padding:20px 28px 32px;color:#9aa1ad;font-size:12px}
         & $add ('<h3>{0} <span class="muted">({1})</span></h3>' -f (enc $d.Name), $dl)
         & $add ('<p class="{0}">{1}</p>' -f $cls, $msg)
 
-        $dcs = @($Topology.Controllers | Where-Object { $_.Domain -eq $d.Name })
-        if (-not $dcs.Count) { $dcs = @($Topology.Controllers) }
+        $dcs = @($Topology.Controllers | Where-Object { $_.DomainName -eq $d.Name })
+        if (-not $dcs.Count) { & $add '<p class="warn">No reachable controller in this domain - nothing could be inspected here.</p>' }
         & $add '<table><thead><tr><th>Controller</th><th>OS</th><th>Logon auditing (4624)</th><th>Kerberos auditing (4768)</th></tr></thead><tbody>'
         foreach ($dc in $dcs) {
             $osCls = if ($dc.OSOk) { 'ok' } else { 'bad' }
@@ -1300,17 +1478,20 @@ function Get-ADPUClearReasons {
         if ($names.Count -le 3) { $names -join ', ' } else { ($names[0..2] -join ', ') + (' and {0} more' -f ($names.Count - 3)) }
     }
 
+    $window = if ($Topology.LookbackDays) { [int]$Topology.LookbackDays } else { 7 }
+
     if (-not $ntlmSeen.Count) {
         & $say 'warn' 'no controller had Logon auditing on - the NTLM check came back empty because it could not look, not because nothing was found'
     } else {
-        & $say 'sub' ('no NTLM logon (4624) carrying this SID in the Security log of {0} controller(s) with logon auditing on: {1}' -f $ntlmSeen.Count, (& $shorten $ntlmSeen))
+        & $say 'sub' ('no NTLM logon (4624) naming this SID in the last {0} day(s) on {1} controller(s) with logon auditing on: {2}' -f $window, $ntlmSeen.Count, (& $shorten $ntlmSeen))
     }
 
     if (-not $kerbSeen.Count) {
         & $say 'warn' 'no controller had Kerberos Authentication Service auditing on - the DES/RC4 check came back empty because it could not look, not because nothing was found'
     } else {
-        & $say 'sub' ('no DES/RC4 Kerberos ticket (4768) carrying this SID on {0} controller(s) with Kerberos auditing on: {1}' -f $kerbSeen.Count, (& $shorten $kerbSeen))
+        & $say 'sub' ('no DES/RC4 Kerberos ticket (4768) naming this SID in the last {0} day(s) on {1} controller(s) with Kerberos auditing on: {2}' -f $window, $kerbSeen.Count, (& $shorten $kerbSeen))
     }
+    & $say 'warn' ('the log window is {0} day(s) - anything older than that was not examined' -f $window)
 
     $blind = @($Topology.Controllers | Where-Object { -not ($_.AuditLogonOk -and $_.AuditKerbOk) })
     if ($blind.Count -and ($ntlmSeen.Count -or $kerbSeen.Count)) {
@@ -1365,7 +1546,14 @@ function Invoke-ADPUVerification {
         Write-ADPULine note "Domain $($d.Name)"
 
         $ctx = [DirectoryServices.ActiveDirectory.DirectoryContext]::new(0, $d.Name)
-        foreach ($dc in [DirectoryServices.ActiveDirectory.DomainController]::FindAll($ctx)) {
+        $dcList = @()
+        try {
+            $dcList = @([DirectoryServices.ActiveDirectory.DomainController]::FindAll($ctx))
+        } catch {
+            Write-ADPULine warn "   Could not enumerate the controllers of $($d.Name) - skipped."
+            $blindSpots++
+        }
+        foreach ($dc in $dcList) {
 
             if (-not (Test-ADPURemoting -Controller $dc)) {
                 Write-ADPULine warn "   $($dc.Name): WinRM closed - skipped."
@@ -1461,6 +1649,11 @@ function Invoke-ADPUAnalyzer {
             Invoke-ADPUAnalyzer -Verify -Days 3
             Skips the readiness review and reports what the Protected Users channels
             recorded for already-enrolled accounts over the last three days.
+        .PARAMETER Days
+            The log window, in days. Governs both the readiness sweep's Security-log
+            harvest (4624/4768) and the -Verify pass. Default 7. Widen it if the
+            environment has long-idle admin accounts; note that auditing is not
+            retroactive, so a wide window still only sees what was recorded.
     #>
     [CmdletBinding()]
     param(
@@ -1506,7 +1699,7 @@ function Invoke-ADPUAnalyzer {
         return
     }
 
-    $topology = Get-ADPUTopology -DomainName $scope
+    $topology = Get-ADPUTopology -DomainName $scope -Days $Days
     $null     = Set-ADPUReadiness -Topology $topology
 
     Write-ADPULine note 'Survey complete - rendering the report.'
