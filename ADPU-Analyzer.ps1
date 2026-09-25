@@ -166,15 +166,19 @@ function Read-ADPUAnswer {
 
 function Read-ADPUYesNo {
     # Loops until the operator gives a clean yes/no. Returns [bool].
+    # A bare Enter takes the default (no, unless told otherwise) - re-asking on an
+    # empty line just repeated the question for every Enter still in the buffer.
     # Unattended runs answer "no" - the caller must never depend on a yes.
     [CmdletBinding()]
-    param([Parameter(Mandatory, Position = 0)] [string]$Question)
+    param([Parameter(Mandatory, Position = 0)] [string]$Question, [bool]$Default = $false)
     if ($script:ADPUNonInteractive) { return $false }
+    $hint = if ($Default) { '(Y/n)' } else { '(y/N)' }
     do {
-        $reply = ([string](Read-ADPUAnswer "$Question (y/n)")).Trim().ToLowerInvariant()
+        $reply = ([string](Read-ADPUAnswer "$Question $hint")).Trim().ToLowerInvariant()
         Write-Host ''
-    } until ($reply -in @('y', 'yes', 'n', 'no'))
-    return ($reply -in @('y', 'yes'))
+        if (-not $reply) { return $Default }
+    } until ($reply -in @('y', 'yes', 'j', 'ja', 'n', 'no', 'nein'))
+    return ($reply -in @('y', 'yes', 'j', 'ja'))
 }
 
 function Read-ADPUMultiChoice {
@@ -696,9 +700,12 @@ if ($onLogon) {
 # instead. 4776 carries no SID, only the bare account name - which is unique
 # inside a domain, so the caller matches it per domain.
 #
-# Successes and failures are counted apart. A failed validation is somebody
-# *trying* NTLM with this name - a stale service, or a password spray - and only
-# a successful one proves that something really depends on NTLM for this account.
+# Successes and failures are counted apart, and failures keep their status code.
+# A success proves a working NTLM dependency. Failures from the same machines
+# over and over usually mean something is still configured to sign this account
+# in over NTLM with an old password - the day someone fixes that password, it
+# needs NTLM and breaks under Protected Users. The scorer blocks on both; only a
+# failure for a name that does not exist on this controller is let through.
 $ntlm4776 = @{}
 if ($onCredVal) {
     $spec = @{ Name = '^TargetUserName$'; Status = '^Status$'; Workstation = '^Workstation$' }
@@ -722,6 +729,10 @@ if ($onCredVal) {
                         Last          = $r.Time
                         Sources       = @()
                         FailedSources = @()
+                        # NTSTATUS -> count, for the failures only. Tells a stale
+                        # saved password (wrong password, locked out) apart from a
+                        # name that simply does not exist here (no such user).
+                        FailedStatus  = @{}
                     }
                 }
                 $h = $ntlm4776[$key]
@@ -733,6 +744,10 @@ if ($onCredVal) {
                 } else {
                     $h.Failed++
                     if ($w -and $h.FailedSources -notcontains $w -and $h.FailedSources.Count -lt 8) { $h.FailedSources += $w }
+                    $code = ([string]$r.Status).Trim()
+                    if ($code -match '^0x([0-9a-fA-F]+)$') { $code = '0x' + $Matches[1].ToUpperInvariant() }
+                    if (-not $code) { $code = 'unknown' }
+                    if ($h.FailedStatus.ContainsKey($code)) { $h.FailedStatus[$code]++ } else { $h.FailedStatus[$code] = 1 }
                 }
             }
             Test-HarvestComplete -Status $st -What '4776 harvest' -Key 'CredVal' -Partial $partial -Notes $notes
@@ -1671,6 +1686,34 @@ function Get-ADPUField {
     if ($p) { $p.Value } else { $null }
 }
 
+# The NTSTATUS codes event 4776 reports for a failed validation, in words. Only
+# the ones that tell the reader something; anything else is shown as its code.
+$script:ADPUNtStatus = @{
+    '0xC000006A' = 'wrong password'
+    '0xC0000064' = 'no such user'
+    '0xC0000234' = 'locked out'
+    '0xC0000072' = 'account disabled'
+    '0xC0000071' = 'password expired'
+    '0xC0000193' = 'account expired'
+    '0xC0000224' = 'must change password'
+    '0xC000006F' = 'outside logon hours'
+    '0xC0000070' = 'workstation not allowed'
+    '0xC000015B' = 'logon type not granted'
+    '0xC0000133' = 'clock skew'
+    '0xC0000371' = 'local account store'
+}
+
+function Format-ADPUStatusCounts {
+    # "wrong password 1200, locked out 188" - largest first.
+    param($Counts)
+    if (-not $Counts) { return '' }
+    $parts = foreach ($code in @($Counts.Keys | Sort-Object { [int]$Counts[$_] } -Descending)) {
+        $label = if ($script:ADPUNtStatus.ContainsKey([string]$code)) { $script:ADPUNtStatus[[string]$code] } else { [string]$code }
+        '{0} {1}' -f $label, [int]$Counts[$code]
+    }
+    ($parts -join ', ')
+}
+
 function New-ADPUFinding {
     param([string]$Code, [ValidateSet('bad','warn')] [string]$Severity, [string]$Text)
     [pscustomobject]@{ Code = $Code; Severity = $Severity; Text = $Text }
@@ -1738,6 +1781,7 @@ function Set-ADPUReadiness {
                 if (-not $credNm.ContainsKey($k)) {
                     $credNm[$k] = [pscustomobject]@{
                         Count = 0; Succeeded = 0; Failed = 0; Last = $h.Last; Sources = @(); FailedSources = @()
+                        FailedStatus = @{}
                     }
                 }
                 $c = $credNm[$k]
@@ -1747,6 +1791,13 @@ function Set-ADPUReadiness {
                 if ($h.Last -gt $c.Last) { $c.Last = $h.Last }
                 $c.Sources       = @(@($c.Sources) + @($h.Sources) | Where-Object { $_ } | Select-Object -Unique)
                 $c.FailedSources = @(@($c.FailedSources) + @(Get-ADPUField $h 'FailedSources') | Where-Object { $_ } | Select-Object -Unique)
+                $fs = Get-ADPUField $h 'FailedStatus'
+                if ($fs) {
+                    foreach ($code in @($fs.Keys)) {
+                        $n = [int]$fs[$code]
+                        if ($c.FailedStatus.ContainsKey($code)) { $c.FailedStatus[$code] += $n } else { $c.FailedStatus[$code] = $n }
+                    }
+                }
             }
         }
         foreach ($dc in ($dcs | Where-Object { $_.AuditKerbOk })) {
@@ -1865,10 +1916,17 @@ function Set-ADPUReadiness {
         $kerbRec   = if ($ix -and $a.Sid -and $ix.Kerb.ContainsKey([string]$a.Sid)) { $ix.Kerb[[string]$a.Sid] } else { $null }
         $credRec   = if ($ix -and $a.Sam -and $ix.CredNames.ContainsKey(([string]$a.Sam).ToLowerInvariant())) { $ix.CredNames[([string]$a.Sam).ToLowerInvariant()] } else { $null }
         $didNtlm   = [bool]($ix -and $a.Sid -and $ix.NtlmSids.Contains([string]$a.Sid))
-        # Only a *successful* NTLM validation proves a dependency. Failures alone
-        # are someone trying the name over NTLM - stale config, or an attack.
+        # A successful NTLM validation proves a dependency. Failures block too:
+        # repeated failures from the same machines are almost always a saved
+        # credential that was never updated, and the day it is, that machine needs
+        # NTLM. The one exception is "no such user" - the name did not resolve to
+        # this account at all, so it says nothing about it.
+        $credStatus  = if ($credRec) { Get-ADPUField $credRec 'FailedStatus' } else { $null }
+        $noSuchUser  = if ($credStatus -and $credStatus.ContainsKey('0xC0000064')) { [int]$credStatus['0xC0000064'] } else { 0 }
+        $failRelevant = if ($credRec) { [int]$credRec.Failed - $noSuchUser } else { 0 }
         $didCred   = [bool]($credRec -and [int]$credRec.Succeeded -gt 0)
-        $failCred  = [bool]($credRec -and [int]$credRec.Succeeded -eq 0 -and [int]$credRec.Failed -gt 0)
+        $failCred  = [bool]($credRec -and [int]$credRec.Succeeded -eq 0 -and $failRelevant -gt 0)
+        $unknownOnly = [bool]($credRec -and [int]$credRec.Succeeded -eq 0 -and $failRelevant -le 0 -and $noSuchUser -gt 0)
         $weakNew    = [bool]($kerbRec -and [int]$kerbRec.WeakNew -gt 0)
         $weakLegacy = [bool]($kerbRec -and [int]$kerbRec.WeakLegacy -gt 0)
         $krbtgtBad  = [bool]($ix -and $ix.KrbtgtBad)
@@ -1922,6 +1980,20 @@ function Set-ADPUReadiness {
             $src = if (@($credRec.Sources).Count) { ' from ' + ((@($credRec.Sources) | Select-Object -First 4) -join ', ') } else { '' }
             $blockers.Add((New-ADPUFinding 'Ntlm4776' 'bad' ('successful NTLM credential validation (event 4776) {0}x in the last {1} day(s){2} - something in the estate still authenticates this account over NTLM' -f $credRec.Succeeded, $window, $src)))
         }
+        if ($failCred) {
+            $srcList = @($credRec.FailedSources)
+            $src  = if ($srcList.Count) { ' from ' + (($srcList | Select-Object -First 4) -join ', ') + $(if ($srcList.Count -gt 4) { ' and more' } else { '' }) } else { '' }
+            $why  = Format-ADPUStatusCounts $credStatus
+            $why  = if ($why) { " ($why)" } else { '' }
+            # Few sources, many attempts: a configured consumer. Many sources: it
+            # may be an attack. Either way it has to be understood first.
+            $read = if ($srcList.Count -and $srcList.Count -le 3) {
+                'something on those machines is still set up to sign this account in over NTLM, most likely with an old saved password - once that password is corrected it needs NTLM and breaks under Protected Users. Find it and move it to Kerberos or another account first'
+            } else {
+                'either something is still set up to use this account over NTLM with an old password, or someone is trying the account - find out which before enrolling'
+            }
+            $blockers.Add((New-ADPUFinding 'Ntlm4776Failed' 'bad' ('{0} failed NTLM validation(s) (event 4776) in the last {1} day(s){2}{3}, none successful - {4}' -f $failRelevant, $window, $src, $why, $read)))
+        }
         if ($weakNew) {
             $blockers.Add((New-ADPUFinding 'WeakKerb' 'bad' ('negotiated a DES/RC4 session key {0}x in the last {1} day(s) (event 4768, session-key field) - fix the cipher usage first' -f $kerbRec.WeakNew, $window)))
         }
@@ -1936,9 +2008,17 @@ function Set-ADPUReadiness {
         }
 
         # ---- hints (never change the verdict) ----------------------------------
-        if ($failCred) {
-            $src = if (@($credRec.FailedSources).Count) { ' from ' + ((@($credRec.FailedSources) | Select-Object -First 4) -join ', ') } else { '' }
-            $hints.Add((New-ADPUFinding 'Ntlm4776Failed' 'warn' ('{0} failed NTLM validation(s) for this name (event 4776){1}, none successful - a stale saved password, or someone trying the account; worth tracking down, but not a dependency' -f $credRec.Failed, $src)))
+        if ($unknownOnly) {
+            $hints.Add((New-ADPUFinding 'Ntlm4776UnknownUser' 'warn' ('{0} NTLM attempt(s) for this name failed as "no such user" (event 4776) - the name did not resolve to this account, so this is not evidence about it; possibly a same-named account elsewhere or a mistyped domain' -f $noSuchUser)))
+        }
+        # Enrolled members can no longer use NTLM at all, so any NTLM for them is
+        # a sign-in that is (or will be) turned away - or it predates enrolment.
+        if ($isEnrolled -and ($didNtlm -or $didCred -or $failCred)) {
+            $n = 0
+            if ($credRec) { $n = [int]$credRec.Succeeded + $failRelevant }
+            $srcList = @(@($(if ($credRec) { $credRec.Sources }) ) + @($(if ($credRec) { $credRec.FailedSources })) | Where-Object { $_ } | Select-Object -Unique)
+            $src = if ($srcList.Count) { ' from ' + (($srcList | Select-Object -First 4) -join ', ') } else { '' }
+            $hints.Add((New-ADPUFinding 'NtlmWhileEnrolled' 'warn' ('already enrolled, yet NTLM was used or tried for it in the last {0} day(s){1}{2} - Protected Users refuses NTLM for members, so these sign-ins are probably failing (unless they predate enrolment); run -Verify to confirm' -f $window, $src, $(if ($n) { " ($n x, event 4776)" } else { '' }))))
         }
         if ($kerbRec -and [int]$kerbRec.NoAesAdv -gt 0) {
             $src = if (@($kerbRec.AdvSources).Count) { ' from ' + ((@($kerbRec.AdvSources) | Select-Object -First 4) -join ', ') } else { '' }
@@ -2041,7 +2121,7 @@ function Set-ADPUReadiness {
             & $say 'Ntlm4624' 'warn' 'no controller in this domain had Logon auditing on - the NTLM check came back empty because it could not look'
         }
         if ($ix -and @($ix.CredValDcs).Count) {
-            & $say 'Ntlm4776' 'sub' ('no successful NTLM credential validation (4776) for this account name in the last {0} day(s) on {1} controller(s): {2}' -f $window, @($ix.CredValDcs).Count, (& $shorten $ix.CredValDcs))
+            & $say 'Ntlm4776' 'sub' ('no NTLM credential validation (4776) for this account name in the last {0} day(s) on {1} controller(s): {2}' -f $window, @($ix.CredValDcs).Count, (& $shorten $ix.CredValDcs))
         } else {
             & $say 'Ntlm4776' 'warn' 'no controller in this domain had Credential Validation auditing on - NTLM against member servers would not have been seen at all'
         }
@@ -2441,7 +2521,12 @@ function Show-ADPUReadinessReport {
 
     # ===== 4. Already enrolled ===============================================
     Write-ADPULine head 'Already enrolled'
-    if ($already) { $already | ForEach-Object { Write-ADPULine good (& $named $_) } }
+    if ($already) {
+        foreach ($a in $already) {
+            Write-ADPULine good (& $named $a)
+            foreach ($h in @($a.Hints | Where-Object { $_.Code -eq 'NtlmWhileEnrolled' })) { Write-ADPULine warn ('   ' + $h.Text) }
+        }
+    }
     else          { Write-ADPULine note 'None yet.' }
     Wait-ADPUEnter
 

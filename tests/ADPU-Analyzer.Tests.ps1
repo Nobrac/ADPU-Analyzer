@@ -72,6 +72,7 @@ $five = @('DC01,System,Credential Validation,{0CCE923F-69AE-11D9-BED3-5050545030
 $m = ConvertFrom-AuditCsv -Lines $five
 Assert-True ($null -eq $m['0cce923f-69ae-11d9-bed3-505054503030'].Value) 'auditpol 5-col without number: value unknown'
 Assert-Equal (Resolve-AuditText 'Erfolg') 1 'German success text resolves'
+Assert-Equal (Format-ADPUStatusCounts @{ '0xC0000234' = 1; '0xC000006A' = 5; '0xC0DEFFFF' = 2 }) 'wrong password 5, 0xC0DEFFFF 2, locked out 1' 'status counts are named and sorted'
 Assert-Equal (Resolve-AuditText 'Keine Überwachung') 0 'German no-auditing text resolves'
 
 # ---------------------------------------------------------------------------
@@ -222,16 +223,47 @@ $r = Get-Scored $t
 Assert-True (Test-Code $r.bob.Hints 'ClientNoAes') 'client offering no AES: hint'
 
 # ---------------------------------------------------------------------------
-# 3. 4776: only a successful validation is a dependency
+# 3. 4776: successes and stale-password failures both block
 # ---------------------------------------------------------------------------
 $acc = New-TestAccount -Sam 'carol' -Rid 1103
-$fail = @{ Account = 'Carol'; Count = 12; Succeeded = 0; Failed = 12; Last = (Get-Date); Sources = @(); FailedSources = @('WS99') }
+$fail = @{ Account = 'Carol'; Count = 12; Succeeded = 0; Failed = 12; Last = (Get-Date); Sources = @(); FailedSources = @('WS99')
+           FailedStatus = @{ '0xC000006A' = 10; '0xC0000234' = 2 } }
 $t = New-TestTopology -Domains (New-TestDomain) -Accounts $acc `
         -Dcs (New-TestDc -Ntlm4776 $fail -Kerb (New-KerbRecord -Sid $acc.Sid))
 $r = Get-Scored $t
-Assert-True (-not (Test-Code $r.carol.Blockers 'Ntlm4776')) '4776 failures only: not blocked'
-Assert-True (Test-Code $r.carol.Hints 'Ntlm4776Failed') '4776 failures only: hint'
-Assert-True ([bool]@($r.carol.Hints | Where-Object { $_.Code -eq 'Ntlm4776Failed' -and $_.Text -match 'WS99' }).Count) '4776 failure hint names the source'
+Assert-True (Test-Code $r.carol.Blockers 'Ntlm4776Failed') '4776 stale-password failures: blocked'
+Assert-True (-not $r.carol.ClearNow) '4776 stale-password failures: not clear'
+$txt = @($r.carol.Blockers | Where-Object { $_.Code -eq 'Ntlm4776Failed' })[0].Text
+Assert-True ($txt -match 'WS99') '4776 failure blocker names the source'
+Assert-True ($txt -match 'wrong password 10, locked out 2') '4776 failure blocker spells out the status codes, largest first'
+Assert-True ($txt -match 'old saved password') 'few sources read as a configured consumer'
+
+# many sources: worded as "consumer or attack"
+$acc = New-TestAccount -Sam 'carol' -Rid 1103
+$spray = @{ Account = 'carol'; Count = 40; Succeeded = 0; Failed = 40; Last = (Get-Date); Sources = @()
+            FailedSources = @('A1','A2','A3','A4','A5'); FailedStatus = @{ '0xC000006A' = 40 } }
+$t = New-TestTopology -Domains (New-TestDomain) -Accounts $acc `
+        -Dcs (New-TestDc -Ntlm4776 $spray -Kerb (New-KerbRecord -Sid $acc.Sid))
+$r = Get-Scored $t
+$txt = @($r.carol.Blockers | Where-Object { $_.Code -eq 'Ntlm4776Failed' })[0].Text
+Assert-True ($txt -match 'someone is trying the account') 'many sources are worded as possibly an attack'
+
+# "no such user" only: not about this account, so hint instead of blocker
+$acc = New-TestAccount -Sam 'carol' -Rid 1103
+$nsu = @{ Account = 'carol'; Count = 5; Succeeded = 0; Failed = 5; Last = (Get-Date); Sources = @()
+          FailedSources = @('WS1'); FailedStatus = @{ '0xC0000064' = 5 } }
+$t = New-TestTopology -Domains (New-TestDomain) -Accounts $acc `
+        -Dcs (New-TestDc -Ntlm4776 $nsu -Kerb (New-KerbRecord -Sid $acc.Sid))
+$r = Get-Scored $t
+Assert-True (-not (Test-Code $r.carol.Blockers 'Ntlm4776Failed')) '"no such user" failures only: not blocked'
+Assert-True (Test-Code $r.carol.Hints 'Ntlm4776UnknownUser') '"no such user" failures only: hint'
+
+# an enrolled account that still sees NTLM gets a pointer to -Verify
+$acc = New-TestAccount -Sam 'carol' -Rid 1103
+$t = New-TestTopology -Domains (New-TestDomain) -Accounts $acc -Enrolled @($acc.Sid) `
+        -Dcs (New-TestDc -Ntlm4776 $fail -Kerb (New-KerbRecord -Sid $acc.Sid))
+$r = Get-Scored $t
+Assert-True (Test-Code $r.carol.Hints 'NtlmWhileEnrolled') 'enrolled account with NTLM: hint to run -Verify'
 
 $acc = New-TestAccount -Sam 'carol' -Rid 1103
 $ok = @{ Account = 'CAROL'; Count = 3; Succeeded = 2; Failed = 1; Last = (Get-Date); Sources = @('APP01'); FailedSources = @() }

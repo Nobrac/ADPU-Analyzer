@@ -67,7 +67,8 @@ Privileged accounts are the recursive membership of a group set, expanded across
 | Check | Source | Why it blocks |
 | --- | --- | --- |
 | **NTLM at a controller** | Security **4624**, `AuthenticationPackageName = NTLM` | Members cannot authenticate over NTLM at all. |
-| **NTLM anywhere in the estate** | Security **4776** (credential validation), **successful** validations only | The case 4624 never sees: NTLM against a member server or workstation reaches the DC as 4776. Failed validations alone are a hint, not a blocker — they show someone *trying* NTLM with the name (a stale saved password, or a password spray), not a working dependency. |
+| **NTLM anywhere in the estate** | Security **4776** (credential validation) | The case 4624 never sees: NTLM against a member server or workstation reaches the DC as 4776. |
+| **NTLM attempts with a stale password** | Security **4776**, failed, with status code | Repeated failures (*wrong password*, *locked out*, …) almost always mean something is still configured to sign this account in over NTLM with an old saved password. The day that password is corrected, it needs NTLM and breaks. The report names the source machines and the status codes; with many different sources it is worded as a possible attack instead. Failures that are only *no such user* are not about this account and stay a hint. |
 | **No AES key material** | **4768** → *Available Keys* | Direct evidence from the KDC that the account has no AES key. Beats every guess. |
 | **Password predates the group** | `pwdLastSet` vs. the group's `whenCreated` | Fallback for the above, used **only** when no key material was observed. |
 | **DES/RC4 Kerberos** | **4768** *Session Key Encryption Type* (newer controllers) — *Ticket Encryption Type* only as a fallback on older ones | DES and RC4 are refused for members. See [the krbtgt trap](#the-krbtgt-trap) for why the ticket field alone is weak evidence. |
@@ -82,7 +83,7 @@ The AD-derived checks come straight out of the directory, so unlike the log-base
 
 ### Hardening hints — informational, never affect the verdict
 
-`adminCount=1` but not in Protected Users · a user account carrying an **SPN** (a service account in disguise) · *password never expires* · password over a year old · *no Kerberos pre-auth* (AS-REP roastable) · **failed** NTLM validations without a successful one (named by workstation) · Kerberos requests from a **client that offered no AES** (named by IP) · a break-glass account that *is* enrolled.
+`adminCount=1` but not in Protected Users · a user account carrying an **SPN** (a service account in disguise) · *password never expires* · password over a year old · *no Kerberos pre-auth* (AS-REP roastable) · NTLM attempts that failed only as *no such user* · Kerberos requests from a **client that offered no AES** (named by IP) · a break-glass account that *is* enrolled · an **already enrolled** account for which NTLM was still used or tried (probably turned away by the group — confirm with `-Verify`).
 
 ### Things no tool can clear you of
 
