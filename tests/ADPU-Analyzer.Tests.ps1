@@ -98,19 +98,22 @@ function New-TestDc {
     param(
         [string]$Name = 'dc01.corp.example.net', [string]$Domain = 'corp.example.net',
         [bool]$New = $true, [bool]$Audit = $true, [bool]$Reachable = $true,
-        $Ntlm4624 = @(), $Ntlm4776 = @(), $Kerb = @(), [hashtable]$Partial = $null
+        $Ntlm4624 = @(), $Ntlm4776 = @(), $Kerb = @(), [hashtable]$Partial = $null,
+        $SvcLogons = @(), [bool]$LogonSuccess = $true, [bool]$LogonFailure = $true
     )
     $state = if ($Audit) { 'On' } else { 'Off' }
     [pscustomobject]@{
         Name = $Name; DomainName = $Domain; OSVersion = 'Windows Server 2022 Standard'; OSOk = $true
         Reachable = $Reachable; Error = $(if ($Reachable) { $null } else { 'no response' })
-        AuditLogonOk = ($Audit -and $Reachable); AuditKerbOk = ($Audit -and $Reachable); AuditCredValOk = ($Audit -and $Reachable)
+        AuditLogonOk = ($Audit -and $Reachable -and $LogonSuccess)
+        AuditLogonFailOk = ($Audit -and $Reachable -and $LogonFailure)
+        AuditKerbOk = ($Audit -and $Reachable); AuditCredValOk = ($Audit -and $Reachable)
         AuditState = @{ Logon = $state; KerbAS = $state; CredVal = $state }
         AuditRaw   = @{ Logon = 'Success'; KerbAS = 'Success'; CredVal = 'Success' }
         AuditMethod = 'auditpol /backup'
         NewKerbFields = $New
         AuditPartial = $(if ($Partial) { $Partial } else { @{ Logon = $false; KerbAS = $false; CredVal = $false } })
-        Ntlm4624 = @($Ntlm4624); Ntlm4776 = @($Ntlm4776); KerbSeen = @($Kerb); KdcRc4 = @()
+        Ntlm4624 = @($Ntlm4624); SvcLogons = @($SvcLogons); Ntlm4776 = @($Ntlm4776); KerbSeen = @($Kerb); KdcRc4 = @()
         Notes = @()
     }
 }
@@ -365,6 +368,68 @@ Assert-True ($cmd.Rsat -match "-Server 'corp.example.net'") 'RSAT command target
 $quote = New-TestAccount -Sam "o'brien" -Rid 1110
 $cmd = Get-ADPUEnrolCommand -Account $quote -LocalDomain 'corp.example.net'
 Assert-True ($cmd.Rsat -match "'o''brien'") 'apostrophe is escaped in the RSAT command'
+
+# ---------------------------------------------------------------------------
+# 7b. Service and scheduled-task logons on the controllers
+# ---------------------------------------------------------------------------
+$acc = New-TestAccount -Sam 'svcadm' -Rid 1120
+$svc = @{ Key = 'svcadm'; Account = 'svcadm'; Sid = $acc.Sid; Batch = 3; Service = 1; BatchFailed = 0; ServiceFailed = 0
+          Processes = @('C:\Windows\System32\services.exe'); FailedStatus = @{}; Last = (Get-Date) }
+$t = New-TestTopology -Domains (New-TestDomain) -Accounts $acc `
+        -Dcs (New-TestDc -SvcLogons $svc -Kerb (New-KerbRecord -Sid $acc.Sid))
+$r = Get-Scored $t
+Assert-True (Test-Code $r.svcadm.Blockers 'ServiceLogon') 'service/batch logon on a DC: blocked'
+$txt = @($r.svcadm.Blockers | Where-Object { $_.Code -eq 'ServiceLogon' })[0].Text
+Assert-True ($txt -match '1 service logon' -and $txt -match '3 scheduled-task' -and $txt -match 'dc01') 'service logon blocker counts both kinds and names the DC'
+
+# failing task with an old password: 4625, matched by name
+$acc = New-TestAccount -Sam 'oldtask' -Rid 1121
+$fail = @{ Key = 'oldtask'; Account = 'OLDTASK'; Sid = $null; Batch = 0; Service = 0; BatchFailed = 40; ServiceFailed = 0
+           Processes = @(); FailedStatus = @{ '0xC000006A' = 40 }; Last = (Get-Date) }
+$t = New-TestTopology -Domains (New-TestDomain) -Accounts $acc `
+        -Dcs (New-TestDc -SvcLogons $fail -Kerb (New-KerbRecord -Sid $acc.Sid))
+$r = Get-Scored $t
+Assert-True (Test-Code $r.oldtask.Blockers 'ServiceLogonFailed') 'failing scheduled task: blocked'
+$txt = @($r.oldtask.Blockers | Where-Object { $_.Code -eq 'ServiceLogonFailed' })[0].Text
+Assert-True ($txt -match 'wrong password 40') 'failing task blocker spells out the status'
+
+# clean account: evidence says what was looked at
+$acc = New-TestAccount -Sam 'clean' -Rid 1122
+$t = New-TestTopology -Domains (New-TestDomain) -Accounts $acc `
+        -Dcs (New-TestDc -LogonSuccess $false -Kerb (New-KerbRecord -Sid $acc.Sid))
+$r = Get-Scored $t
+$ev = @($r.clean.Evidence | Where-Object { $_.Code -eq 'ServiceLogon' })[0]
+Assert-True ($ev.Severity -eq 'sub' -and $ev.Text -match 'failed \(4625\)' -and $ev.Text -notmatch 'successful') 'failure-only logon auditing is described as such'
+
+$acc = New-TestAccount -Sam 'clean' -Rid 1122
+$t = New-TestTopology -Domains (New-TestDomain) -Accounts $acc `
+        -Dcs (New-TestDc -LogonSuccess $false -LogonFailure $false -Kerb (New-KerbRecord -Sid $acc.Sid))
+$r = Get-Scored $t
+$ev = @($r.clean.Evidence | Where-Object { $_.Code -eq 'ServiceLogon' })[0]
+Assert-Equal $ev.Severity 'warn' 'no logon auditing at all: service check could not look'
+
+# a same-named failure in another domain's DCs must not stick to this account
+$acc = New-TestAccount -Sam 'oldtask' -Rid 1121
+$t = New-TestTopology -Domains (New-TestDomain) -Accounts $acc `
+        -Dcs (New-TestDc -Name 'dc09.child.example.net' -Domain 'child.example.net' -SvcLogons $fail)
+$r = Get-Scored $t
+Assert-True (-not (Test-Code $r.oldtask.Blockers 'ServiceLogonFailed')) 'service logon evidence stays within the account''s domain'
+
+# ---------------------------------------------------------------------------
+# 7c. -Identity mode renders its own wording
+# ---------------------------------------------------------------------------
+$acc = New-TestAccount -Sam 'alice' -Rid 1101
+$t = New-TestTopology -Domains (New-TestDomain) -Accounts $acc -Dcs (New-TestDc -Kerb (New-KerbRecord -Sid $acc.Sid))
+$t | Add-Member -NotePropertyName Identity -NotePropertyValue @('alice') -Force
+$null = Set-ADPUReadiness -Topology $t
+$out = & { Show-ADPUReadinessReport -Topology $t } 6>&1 | Out-String
+Assert-True ($out -match 'given with -Identity: alice') 'console summary names the -Identity accounts'
+$html = Join-Path ([IO.Path]::GetTempPath()) ('adpu-id-{0}.html' -f [guid]::NewGuid())
+try {
+    $null = Export-ADPUHtmlReport -Topology $t -Path $html
+    Assert-True ((Get-Content -LiteralPath $html -Raw) -match '-Identity alice') 'HTML header names the -Identity accounts'
+    Assert-True (@((ConvertTo-ADPUResult -Topology $t).Identity) -contains 'alice') 'JSON carries the -Identity list'
+} finally { Remove-Item -LiteralPath $html -ErrorAction SilentlyContinue }
 
 # ---------------------------------------------------------------------------
 # 8. Kitchen sink: every report path renders

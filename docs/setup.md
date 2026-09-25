@@ -16,7 +16,7 @@
 
 | Category → Subcategory | Value | Produces |
 | --- | --- | --- |
-| Logon/Logoff → **Audit Logon** | `Success` | **4624** — NTLM aimed at a controller |
+| Logon/Logoff → **Audit Logon** | `Success` (and `Failure`) | **4624** — NTLM aimed at a controller, service and scheduled-task logons on it; **4625** (with *Failure*) — failing service and task logons |
 | Account Logon → **Audit Kerberos Authentication Service** | `Success` | **4768** — DES/RC4 use and account key material |
 | Account Logon → **Audit Credential Validation** | `Success` | **4776** — NTLM anywhere in the domain |
 

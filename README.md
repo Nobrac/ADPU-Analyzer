@@ -19,7 +19,7 @@
 *Protected Users* blocks NTLM, DES/RC4, delegation and credential caching for its members — with no per-account exceptions. Add an admin that still depends on any of that and its sign-in breaks. ADPU-Analyzer reads the directory and the domain controllers' event logs and tells you, per privileged account:
 
 - **clear to enrol** — with how strong the evidence is (*proven*, *plausible*, *unknown*)
-- **blocked** — and exactly why (NTLM use, no AES keys, RC4, delegation, …)
+- **blocked** — and exactly why (NTLM use, no AES keys, RC4, delegation, running services or tasks, …)
 - **what it could not see** — auditing gaps, unreachable controllers
 - **whether it held** after enrolling (`-Verify`)
 
@@ -30,6 +30,7 @@ It never changes anything. It prints the commands for you to run, including the 
 ```powershell
 .\ADPU-Analyzer.ps1                                   # pick a domain interactively
 .\ADPU-Analyzer.ps1 -Domain corp.example.net -Days 30 -HtmlPath .\report.html
+.\ADPU-Analyzer.ps1 -Identity alice, 'CORP\bob'        # check single accounts
 .\ADPU-Analyzer.ps1 -Verify -Days 7                   # after enrolling
 ```
 

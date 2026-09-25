@@ -15,6 +15,7 @@
 #    .\ADPU-Analyzer.ps1 -Scope Extended               widen the privileged set
 #    .\ADPU-Analyzer.ps1 -Days 30                      widen the log window
 #    .\ADPU-Analyzer.ps1 -BreakGlass 'CORP\emergency'   keep an emergency admin out
+#    .\ADPU-Analyzer.ps1 -Identity alice, 'CORP\bob'     check just these accounts
 #    .\ADPU-Analyzer.ps1 -Verify -Days 7               after enrolling: read the
 #                                                      Protected Users channels
 #    .\ADPU-Analyzer.ps1 -NonInteractive -JsonPath .\r.json    for scheduled runs
@@ -58,6 +59,10 @@ param(
     # SID, sAMAccountName or DOMAIN\name. The built-in Administrator (RID 500)
     # is always treated this way.
     [string[]]$BreakGlass,
+
+    # Review exactly these accounts instead of the privileged group set - by
+    # SID, sAMAccountName, DOMAIN\name or UPN. A group name reviews its members.
+    [string[]]$Identity,
 
     # How far back the log harvest reaches.
     [ValidateRange(1, 365)]
@@ -694,6 +699,95 @@ if ($onLogon) {
     }
 }
 
+# ------------------------------------------------ 4624/4625: service and batch logons
+# An account that logs on as a service (logon type 5) or a scheduled task
+# (logon type 4) is a service account in practice, whatever its name. Protected
+# Users gives it a 4-hour TGT that cannot be renewed, no delegation and no
+# "do not store password" (S4U) tasks - Microsoft's guidance is to keep service
+# accounts out of the group altogether.
+#
+# Only logons on the controllers themselves are visible here; a task on a member
+# server logs its 4624 on that server. Successes need Logon success auditing;
+# the failures (4625) need Logon *failure* auditing, which many domains have on
+# even when success auditing is off - and a service or task that keeps failing
+# is exactly the "old password still saved somewhere" case.
+#
+# 4625 usually carries the NULL SID for the target, so failures are matched by
+# account name, like 4776.
+$svcLogons = @{}
+$logonFailOn = $false
+if ($aud.Logon.State -ne 'Unknown') {
+    $lv = $aud.Logon.Value
+    $logonFailOn = ($null -ne $lv -and ((([int]$lv) -band 2) -eq 2))
+    if ($null -eq $lv -and ([string]$aud.Logon.Text) -match '(Failure|Fehler|Échec|Errore|Mislukt)') { $logonFailOn = $true }
+}
+$svcTypes = "(Data[@Name='LogonType']='4' or Data[@Name='LogonType']='5')"
+
+function Add-SvcLogon {
+    param([hashtable]$Map, [string]$Key, [string]$Account, [string]$Sid, [int]$Type, [bool]$Ok, $Time, [string]$Process, [string]$Status)
+    if (-not $Map.ContainsKey($Key)) {
+        $Map[$Key] = @{
+            Key = $Key; Account = $Account; Sid = $Sid
+            Batch = 0; Service = 0; BatchFailed = 0; ServiceFailed = 0
+            Processes = @(); FailedStatus = @{}; Last = $Time
+        }
+    }
+    $h = $Map[$Key]
+    if ($Sid -and -not $h.Sid) { $h.Sid = $Sid }
+    if ($Type -eq 4) { if ($Ok) { $h.Batch++ } else { $h.BatchFailed++ } }
+    else             { if ($Ok) { $h.Service++ } else { $h.ServiceFailed++ } }
+    if ($Time -gt $h.Last) { $h.Last = $Time }
+    if ($Process -and $Process -ne '-' -and $h.Processes -notcontains $Process -and $h.Processes.Count -lt 5) { $h.Processes += $Process }
+    if (-not $Ok) {
+        $code = ([string]$Status).Trim()
+        if ($code -match '^0x([0-9a-fA-F]+)$') { $code = '0x' + $Matches[1].ToUpperInvariant() }
+        if (-not $code) { $code = 'unknown' }
+        if ($h.FailedStatus.ContainsKey($code)) { $h.FailedStatus[$code]++ } else { $h.FailedStatus[$code] = 1 }
+    }
+}
+
+if ($onLogon) {
+    $spec = @{ Sid = '^TargetUserSid$'; Name = '^TargetUserName$'; Type = '^LogonType$'; Process = '^ProcessName$' }
+    try {
+        foreach ($chunk in (Split-Chunk $TargetSids)) {
+            $x = "*[EventData[$svcTypes][{0}]]" -f (New-OrClause 'TargetUserSid' $chunk) +
+                 "[System[(EventID=4624) and TimeCreated[timediff(@SystemTime) <= $span]]]"
+            $st = @{}
+            foreach ($r in (Get-EventRows -Log 'Security' -Xpath $x -Spec $spec -Cache $fieldMaps -Status $st)) {
+                $nm = [string]$r.Name
+                if (-not $nm) { continue }
+                Add-SvcLogon -Map $svcLogons -Key $nm.ToLowerInvariant() -Account $nm -Sid ([string]$r.Sid) `
+                             -Type ([int]$r.Type) -Ok $true -Time $r.Time -Process ([string]$r.Process)
+            }
+            Test-HarvestComplete -Status $st -What '4624 service/batch harvest' -Key 'Logon' -Partial $partial -Notes $notes
+        }
+    } catch {
+        $notes.Add("4624 service/batch harvest failed: $($_.Exception.Message)")
+    }
+}
+if ($logonFailOn) {
+    $spec = @{ Name = '^TargetUserName$'; Type = '^LogonType$'; Process = '^ProcessName$'; Status = '^Status$'; Sub = '^SubStatus$' }
+    try {
+        foreach ($chunk in (Split-Chunk $filterNames)) {
+            $x = "*[EventData[$svcTypes][{0}]]" -f (New-OrClause 'TargetUserName' $chunk) +
+                 "[System[(EventID=4625) and TimeCreated[timediff(@SystemTime) <= $span]]]"
+            $st = @{}
+            foreach ($r in (Get-EventRows -Log 'Security' -Xpath $x -Spec $spec -Cache $fieldMaps -Status $st)) {
+                $nm = [string]$r.Name
+                if (-not $nm) { continue }
+                # The sub-status carries the specific reason (wrong password,
+                # locked out, ...); the status is often just "logon failure".
+                $why = if ([string]$r.Sub -match '^0x0*[1-9a-fA-F]') { [string]$r.Sub } else { [string]$r.Status }
+                Add-SvcLogon -Map $svcLogons -Key $nm.ToLowerInvariant() -Account $nm -Sid $null `
+                             -Type ([int]$r.Type) -Ok $false -Time $r.Time -Process ([string]$r.Process) -Status $why
+            }
+            Test-HarvestComplete -Status $st -What '4625 service/batch harvest' -Key 'Logon' -Partial $partial -Notes $notes
+        }
+    } catch {
+        $notes.Add("4625 service/batch harvest failed: $($_.Exception.Message)")
+    }
+}
+
 # ------------------------------------------------------------------- 4776: NTLM
 # The one that matters most. 4624 only sees NTLM aimed at the controller itself;
 # NTLM against a member server or workstation reaches the controller as 4776
@@ -924,6 +1018,7 @@ try {
 [pscustomobject]@{
     Computer      = $env:COMPUTERNAME
     AuditLogon    = $onLogon
+    AuditLogonFail = $logonFailOn
     AuditKerb     = $onKerb
     AuditCredVal  = $onCredVal
     AuditMethod   = $auditMethod
@@ -939,6 +1034,7 @@ try {
     }
     AuditPartial  = $partial
     Ntlm4624      = @($ntlm4624.Values)
+    SvcLogons     = @($svcLogons.Values)
     Ntlm4776      = @($ntlm4776.Values)
     KerbSeen      = @($kerb.Values)
     Kerb4768Ver   = $maxVer
@@ -1422,6 +1518,65 @@ function ConvertTo-ADPUAccount {
     $acct
 }
 
+function Find-ADPUIdentity {
+    <#
+        Resolves one -Identity value to directory principals in the reviewed
+        domains. Accepts a SID, DOMAIN\name (NetBIOS or DNS domain), a UPN, or a
+        bare sAMAccountName. A bare name that exists in several domains returns
+        every match - they are different accounts, and each is reviewed. A group
+        is expanded to its members, recursively.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Identity,
+        [Parameter(Mandatory)] $Domains,
+        [pscredential]$Credential
+    )
+
+    $sidTxt = $null
+    if ($Identity -match '^S-1-5-21-') {
+        $sidTxt = $Identity
+    } elseif ($Identity -match '\\') {
+        # NTAccount understands the NetBIOS form natively; only a fallback below
+        # is needed when that translation is not possible from this machine.
+        try { $sidTxt = ([Security.Principal.NTAccount]::new($Identity)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { }
+    }
+
+    $found = [System.Collections.Generic.List[object]]::new()
+    if ($sidTxt) {
+        $sid = [Security.Principal.SecurityIdentifier]::new($sidTxt)
+        $dom = @($Domains | Where-Object { $_.Sid -eq [string]$sid.AccountDomainSid }) | Select-Object -First 1
+        if ($dom) {
+            try {
+                $ctx = Get-ADPUPrincipalContext -DomainName $dom.Name -Credential $Credential
+                $p = [DirectoryServices.AccountManagement.Principal]::FindByIdentity(
+                         $ctx, [DirectoryServices.AccountManagement.IdentityType]::Sid, $sidTxt)
+                if ($p) { $found.Add($p) }
+            } catch { }
+        }
+    } else {
+        $prefix = $null
+        $name   = $Identity
+        if ($Identity -match '\\') { $prefix, $name = $Identity -split '\\', 2 }
+        foreach ($d in @($Domains)) {
+            if ($prefix -and -not ($d.Name -ieq $prefix -or ($d.Name -split '\.')[0] -ieq $prefix)) { continue }
+            try {
+                $ctx = Get-ADPUPrincipalContext -DomainName $d.Name -Credential $Credential
+                $p = [DirectoryServices.AccountManagement.Principal]::FindByIdentity($ctx, $name)
+                if ($p) { $found.Add($p) }
+            } catch { }
+        }
+    }
+
+    foreach ($p in $found) {
+        if ($p -is [DirectoryServices.AccountManagement.GroupPrincipal]) {
+            try { $p.GetMembers($true) } catch { Write-ADPULine warn "Could not read all members of $Identity - the list may be incomplete." }
+        } else {
+            $p
+        }
+    }
+}
+
 function Get-ADPUTopology {
     <#
         .SYNOPSIS
@@ -1446,7 +1601,10 @@ function Get-ADPUTopology {
         [ValidateSet('Core','Extended')] [string]$Scope = 'Core',
         [string[]]$IncludeGroup,
         [switch]$StrictScope,
-        [pscredential]$Credential
+        [pscredential]$Credential,
+        # Review exactly these accounts (or group members) instead of the
+        # privileged group set. They do not have to be admins.
+        [string[]]$Identity
     )
 
     # -- forest -----------------------------------------------------------------
@@ -1508,11 +1666,39 @@ function Get-ADPUTopology {
     }
 
     # -- privileged accounts ----------------------------------------------------
-    Write-ADPULine note "Collecting privileged accounts ($Scope scope)..."
-    $wanted = @($script:ADPUGroupCatalog | Where-Object { $_.Tier -eq 'Core' -or $Scope -eq 'Extended' })
-
     $byKey = [ordered]@{}
-    foreach ($d in $domains) {
+    $wanted = @()
+    $groupDomains = $domains
+    $requested = @($Identity | Where-Object { $_ })
+    if ($requested.Count) {
+        # -Identity replaces the group sweep: the named accounts are reviewed
+        # whether or not they are privileged.
+        Write-ADPULine note ("Looking up {0} account(s) given with -Identity..." -f $requested.Count)
+        $groupDomains = @()
+        foreach ($id in $requested) {
+            $hits = @(Find-ADPUIdentity -Identity $id -Domains $domains -Credential $Credential)
+            if (-not $hits.Count) {
+                Write-ADPULine warn "'$id' was not found in the domain(s) under review - skipped."
+                continue
+            }
+            $homes = @($hits | ForEach-Object { try { [string]$_.Context.Name } catch { '' } } | Where-Object { $_ } | Select-Object -Unique)
+            if ($homes.Count -gt 1) {
+                Write-ADPULine note "'$id' exists in several domains ($($homes -join ', ')) - each one is reviewed."
+            }
+            foreach ($member in $hits) {
+                $acct = ConvertTo-ADPUAccount -Principal $member -DomainMap $domainMap -ViaGroup '-Identity'
+                $acct.FoundVia = $acct.Domain
+                $key = if ($acct.Sid) { $acct.Sid } else { "$($acct.Domain)\$($acct.Sam)" }
+                if (-not $byKey.Contains($key)) { $byKey[$key] = $acct }
+            }
+        }
+        if (-not $byKey.Count) { throw 'None of the accounts given with -Identity were found in the domain(s) under review.' }
+    } else {
+        Write-ADPULine note "Collecting privileged accounts ($Scope scope)..."
+        $wanted = @($script:ADPUGroupCatalog | Where-Object { $_.Tier -eq 'Core' -or $Scope -eq 'Extended' })
+    }
+
+    foreach ($d in $groupDomains) {
         $entries = foreach ($e in $wanted) {
             $id = Resolve-ADPUGroupIdentity -Entry $e -DomainSid $d.Sid -IsForestRoot $d.IsRoot
             if ($id) { [pscustomobject]@{ Label = $e.Label; Identity = $id } }
@@ -1583,6 +1769,7 @@ function Get-ADPUTopology {
                 Reachable      = $false
                 Error          = $null
                 AuditLogonOk   = $false
+                AuditLogonFailOk = $false
                 AuditKerbOk    = $false
                 AuditCredValOk = $false
                 AuditState     = @{ Logon = 'Unknown'; KerbAS = 'Unknown'; CredVal = 'Unknown' }
@@ -1591,6 +1778,7 @@ function Get-ADPUTopology {
                 NewKerbFields  = $false
                 AuditPartial   = @{ Logon = $false; KerbAS = $false; CredVal = $false }
                 Ntlm4624       = @()
+                SvcLogons      = @()
                 Ntlm4776       = @()
                 KerbSeen       = @()
                 KdcRc4         = @()
@@ -1610,6 +1798,7 @@ function Get-ADPUTopology {
                 $f = $facts.Facts[$dc.Name]
                 $dc.Reachable      = $true
                 $dc.AuditLogonOk   = [bool]$f.AuditLogon
+                $dc.AuditLogonFailOk = [bool]$f.AuditLogonFail
                 $dc.AuditKerbOk    = [bool]$f.AuditKerb
                 $dc.AuditCredValOk = [bool]$f.AuditCredVal
                 $dc.AuditState     = $f.AuditState
@@ -1627,6 +1816,7 @@ function Get-ADPUTopology {
                     }
                 }
                 $dc.Ntlm4624       = @($f.Ntlm4624)
+                $dc.SvcLogons      = @($f.SvcLogons)
                 $dc.Ntlm4776       = @($f.Ntlm4776)
                 $dc.KerbSeen       = @($f.KerbSeen)
                 $dc.KdcRc4         = @($f.KdcRc4)
@@ -1651,6 +1841,7 @@ function Get-ADPUTopology {
         EnrolledSids = $pugSids
         LookbackDays = $Days
         Scope        = $Scope
+        Identity     = @($requested)
         StrictScope  = [bool]$StrictScope
         ExcludedForeign = $excludedForeign
         Generated    = (Get-Date)
@@ -1762,11 +1953,46 @@ function Set-ADPUReadiness {
         $dcs = @($Topology.Controllers | Where-Object { $_.DomainName -ieq $d.Name })
 
         $ntlmSid = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $svcSid  = @{}
+        $svcName = @{}
         $credNm  = @{}
         $kerb    = @{}
 
         foreach ($dc in ($dcs | Where-Object { $_.AuditLogonOk })) {
             foreach ($h in @($dc.Ntlm4624)) { if ($h.Sid) { [void]$ntlmSid.Add([string]$h.Sid) } }
+        }
+        # Service and batch logons on the controllers: successes carry a SID,
+        # failures (4625) only a name. Both are folded per domain.
+        foreach ($dc in ($dcs | Where-Object { $_.AuditLogonOk -or (Get-ADPUField $_ 'AuditLogonFailOk') })) {
+            foreach ($h in @(Get-ADPUField $dc 'SvcLogons')) {
+                if (-not $h) { continue }
+                $sidKey  = [string](Get-ADPUField $h 'Sid')
+                $nameKey = ([string](Get-ADPUField $h 'Account')).ToLowerInvariant()
+                $target  = if ($sidKey) { $svcSid } else { $svcName }
+                $k       = if ($sidKey) { $sidKey } else { $nameKey }
+                if (-not $k) { continue }
+                if (-not $target.ContainsKey($k)) {
+                    $target[$k] = [pscustomobject]@{
+                        Batch = 0; Service = 0; BatchFailed = 0; ServiceFailed = 0
+                        Processes = @(); FailedStatus = @{}; Dcs = @(); Last = $null
+                    }
+                }
+                $c = $target[$k]
+                $c.Batch         += [int](Get-ADPUField $h 'Batch')
+                $c.Service       += [int](Get-ADPUField $h 'Service')
+                $c.BatchFailed   += [int](Get-ADPUField $h 'BatchFailed')
+                $c.ServiceFailed += [int](Get-ADPUField $h 'ServiceFailed')
+                $c.Processes = @(@($c.Processes) + @(Get-ADPUField $h 'Processes') | Where-Object { $_ } | Select-Object -Unique)
+                if ($c.Dcs -notcontains $dc.Name) { $c.Dcs = @($c.Dcs) + $dc.Name }
+                $fs = Get-ADPUField $h 'FailedStatus'
+                if ($fs) {
+                    foreach ($code in @($fs.Keys)) {
+                        if ($c.FailedStatus.ContainsKey($code)) { $c.FailedStatus[$code] += [int]$fs[$code] } else { $c.FailedStatus[$code] = [int]$fs[$code] }
+                    }
+                }
+                $last = Get-ADPUField $h 'Last'
+                if ($null -eq $c.Last -or $last -gt $c.Last) { $c.Last = $last }
+            }
         }
         foreach ($dc in ($dcs | Where-Object { $_.AuditCredValOk })) {
             foreach ($h in @($dc.Ntlm4776)) {
@@ -1855,6 +2081,9 @@ function Set-ADPUReadiness {
             PartialDcs   = @($reachable | Where-Object {
                                (& $isPartial $_ 'Logon') -or (& $isPartial $_ 'KerbAS') -or (& $isPartial $_ 'CredVal') })
             NtlmSids     = $ntlmSid
+            SvcSids      = $svcSid
+            SvcNames     = $svcName
+            LogonFailDcs = @($reachable | Where-Object { Get-ADPUField $_ 'AuditLogonFailOk' })
             CredNames    = $credNm
             Kerb         = $kerb
             KrbtgtBad    = $krbtgtBad
@@ -1916,6 +2145,8 @@ function Set-ADPUReadiness {
         $kerbRec   = if ($ix -and $a.Sid -and $ix.Kerb.ContainsKey([string]$a.Sid)) { $ix.Kerb[[string]$a.Sid] } else { $null }
         $credRec   = if ($ix -and $a.Sam -and $ix.CredNames.ContainsKey(([string]$a.Sam).ToLowerInvariant())) { $ix.CredNames[([string]$a.Sam).ToLowerInvariant()] } else { $null }
         $didNtlm   = [bool]($ix -and $a.Sid -and $ix.NtlmSids.Contains([string]$a.Sid))
+        $svcOk   = if ($ix -and $a.Sid -and $ix.SvcSids.ContainsKey([string]$a.Sid)) { $ix.SvcSids[[string]$a.Sid] } else { $null }
+        $svcFail = if ($ix -and $a.Sam -and $ix.SvcNames.ContainsKey(([string]$a.Sam).ToLowerInvariant())) { $ix.SvcNames[([string]$a.Sam).ToLowerInvariant()] } else { $null }
         # A successful NTLM validation proves a dependency. Failures block too:
         # repeated failures from the same machines are almost always a saved
         # credential that was never updated, and the day it is, that machine needs
@@ -1972,6 +2203,24 @@ function Set-ADPUReadiness {
         }
         if ($unconstr) {
             $blockers.Add((New-ADPUFinding 'Unconstrained' 'bad' 'trusted for unconstrained delegation - members of the group cannot delegate, and this is a high-value target in its own right'))
+        }
+        if ($svcOk -and ([int]$svcOk.Service + [int]$svcOk.Batch) -gt 0) {
+            $what = @(
+                if ([int]$svcOk.Service) { '{0} service logon(s)' -f [int]$svcOk.Service }
+                if ([int]$svcOk.Batch)   { '{0} scheduled-task (batch) logon(s)' -f [int]$svcOk.Batch }
+            ) -join ' and '
+            $proc = if (@($svcOk.Processes).Count) { ' via ' + ((@($svcOk.Processes) | Select-Object -First 3) -join ', ') } else { '' }
+            $blockers.Add((New-ADPUFinding 'ServiceLogon' 'bad' ('{0} on {1}{2} in the last {3} day(s) (event 4624) - the account runs a service or task. Protected Users gives it a 4-hour TGT that cannot be renewed, no delegation and no "do not store password" tasks; move that workload to a gMSA or a dedicated service account first' -f $what, ((@($svcOk.Dcs) | Select-Object -First 3) -join ', '), $proc, $window)))
+        }
+        if ($svcFail -and ([int]$svcFail.ServiceFailed + [int]$svcFail.BatchFailed) -gt 0) {
+            $what = @(
+                if ([int]$svcFail.ServiceFailed) { '{0} failed service logon(s)' -f [int]$svcFail.ServiceFailed }
+                if ([int]$svcFail.BatchFailed)   { '{0} failed scheduled-task (batch) logon(s)' -f [int]$svcFail.BatchFailed }
+            ) -join ' and '
+            $why  = Format-ADPUStatusCounts $svcFail.FailedStatus
+            $why  = if ($why) { " ($why)" } else { '' }
+            $proc = if (@($svcFail.Processes).Count) { ' via ' + ((@($svcFail.Processes) | Select-Object -First 3) -join ', ') } else { '' }
+            $blockers.Add((New-ADPUFinding 'ServiceLogonFailed' 'bad' ('{0} on {1}{2}{3} in the last {4} day(s) (event 4625) - a service or scheduled task is still configured with this account, most likely with an old password. Find it and move it to a gMSA or a dedicated service account before enrolling' -f $what, ((@($svcFail.Dcs) | Select-Object -First 3) -join ', '), $proc, $why, $window)))
         }
         if ($didNtlm) {
             $blockers.Add((New-ADPUFinding 'Ntlm4624' 'bad' ('authenticated with NTLM at a domain controller (event 4624) inside the last {0} day(s) - track down the dependency first' -f $window)))
@@ -2124,6 +2373,15 @@ function Set-ADPUReadiness {
             & $say 'Ntlm4776' 'sub' ('no NTLM credential validation (4776) for this account name in the last {0} day(s) on {1} controller(s): {2}' -f $window, @($ix.CredValDcs).Count, (& $shorten $ix.CredValDcs))
         } else {
             & $say 'Ntlm4776' 'warn' 'no controller in this domain had Credential Validation auditing on - NTLM against member servers would not have been seen at all'
+        }
+        if ($ix -and (@($ix.LogonDcs).Count -or @($ix.LogonFailDcs).Count)) {
+            $seen = @(
+                if (@($ix.LogonDcs).Count)     { 'successful (4624)' }
+                if (@($ix.LogonFailDcs).Count) { 'failed (4625)' }
+            ) -join ' or '
+            & $say 'ServiceLogon' 'sub' ('no {0} service or scheduled-task logon on the controllers in the last {1} day(s) - member servers are not visible from here' -f $seen, $window)
+        } else {
+            & $say 'ServiceLogon' 'warn' 'Logon auditing (success or failure) is off on every controller - service and scheduled-task logons could not be looked for'
         }
         if ($ix -and @($ix.KerbDcs).Count) {
             $how = if (@($ix.NewFieldDcs).Count -ge @($ix.KerbDcs).Count) { 'negotiated session key' } else { 'session key or, on older controllers, ticket' }
@@ -2436,7 +2694,12 @@ function Show-ADPUReadinessReport {
 
     # ===== 1. Bottom line ====================================================
     Write-ADPULine head 'Summary'
-    Write-ADPULine sub  ("Privileged = recursive membership of the {0} group set." -f $Topology.Scope.ToLowerInvariant())
+    $idList = @(Get-ADPUField $Topology 'Identity' | Where-Object { $_ })
+    if ($idList.Count) {
+        Write-ADPULine sub  ("Reviewing the account(s) given with -Identity: {0}. Admin group membership is not required." -f ($idList -join ', '))
+    } else {
+        Write-ADPULine sub  ("Privileged = recursive membership of the {0} group set." -f $Topology.Scope.ToLowerInvariant())
+    }
     Write-ADPULine sub  'Real user accounts belong in Protected Users; computer, service and managed accounts do not.'
     Write-ADPULine sub  ('Clear = no blocker found in the last {0} day(s) of the logs that could be read. Each verdict is itemised below.' -f $window)
     Write-ADPULine note ("{0} privileged account(s) in total." -f $s.Total)
@@ -2797,9 +3060,11 @@ document.addEventListener('click',function(e){
     & $add ('<style>{0}</style>' -f $css)
     & $add '</head><body>'
 
+    $idList     = @(Get-ADPUField $Topology 'Identity' | Where-Object { $_ })
+    $scopeLabel = if ($idList.Count) { '-Identity ' + ($idList -join ', ') + ' -' } else { $Topology.Scope }
     & $add '<header><h1>ADPU-Analyzer</h1>'
     & $add ('<p class="muted">Forest <strong>{0}</strong> &middot; {1} scope &middot; {2}-day window &middot; generated {3:yyyy-MM-dd HH:mm} &middot; Made by Carbon/Nobrac</p>' -f
-            (& $enc $Topology.Forest.Name), (& $enc $Topology.Scope), [int]$Topology.LookbackDays, $now)
+            (& $enc $Topology.Forest.Name), (& $enc $scopeLabel), [int]$Topology.LookbackDays, $now)
     & $add '</header><main>'
 
     & $add '<section class="cards">'
@@ -3016,6 +3281,7 @@ function ConvertTo-ADPUResult {
         Generated = $Topology.Generated
         Forest    = $Topology.Forest.Name
         Scope     = $Topology.Scope
+        Identity  = @(Get-ADPUField $Topology 'Identity' | Where-Object { $_ })
         StrictScope = [bool]$Topology.StrictScope
         Days      = $Topology.LookbackDays
         Summary   = [pscustomobject]@{
@@ -3040,7 +3306,7 @@ function ConvertTo-ADPUResult {
             [pscustomobject]@{
                 Name = $dc.Name; Domain = $dc.DomainName; OS = $dc.OSVersion; OSOk = $dc.OSOk
                 Reachable = $dc.Reachable; Error = $dc.Error
-                AuditLogon = $dc.AuditLogonOk; AuditKerberos = $dc.AuditKerbOk
+                AuditLogon = $dc.AuditLogonOk; AuditLogonFailure = [bool](Get-ADPUField $dc 'AuditLogonFailOk'); AuditKerberos = $dc.AuditKerbOk
                 AuditCredentialValidation = $dc.AuditCredValOk
                 AuditState = $dc.AuditState; AuditReported = $dc.AuditRaw; AuditReadVia = $dc.AuditMethod
                 NewKerberosFields = $dc.NewKerbFields
@@ -3357,6 +3623,7 @@ function Invoke-ADPUAnalyzer {
         [string[]]$IncludeGroup,
         [switch]$StrictScope,
         [string[]]$BreakGlass,
+        [string[]]$Identity,
         [ValidateRange(1, 365)] [int]$Days = 7,
         [pscredential]$Credential,
         [string]$HtmlPath,
@@ -3386,7 +3653,8 @@ function Invoke-ADPUAnalyzer {
         # Decide the scope. If -Domain was supplied, honour it. Otherwise discover the
         # forest's domains and, when there is more than one, let the operator pick.
         $picked = $Domain
-        if (-not $picked -and -not $NonInteractive) {
+        # With -Identity and no -Domain, every domain is searched - no prompt.
+        if (-not $picked -and -not $NonInteractive -and -not $Identity) {
             $forest = Get-ADPUForest -Credential $Credential
             $names  = @($forest.Domains | ForEach-Object { [string]$_.Name } | Sort-Object)
             if ($names.Count -gt 1) {
@@ -3405,7 +3673,8 @@ function Invoke-ADPUAnalyzer {
         }
 
         $topology = Get-ADPUTopology -DomainName $picked -Days $Days -Scope $Scope `
-                                     -IncludeGroup $IncludeGroup -StrictScope:$StrictScope -Credential $Credential
+                                     -IncludeGroup $IncludeGroup -StrictScope:$StrictScope -Credential $Credential `
+                                         -Identity $Identity
         $topology | Add-Member -NotePropertyName BreakGlass -NotePropertyValue @($BreakGlass | Where-Object { $_ }) -Force
         $null = Set-ADPUReadiness -Topology $topology
 
@@ -3466,7 +3735,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     foreach ($k in $PSBoundParameters.Keys) {
         # Common parameters (-Verbose and friends) are not part of the function's
         # own signature and would break the splat.
-        if ($k -in @('Domain','Scope','IncludeGroup','StrictScope','BreakGlass','Days','Credential','HtmlPath',
+        if ($k -in @('Domain','Scope','IncludeGroup','StrictScope','BreakGlass','Identity','Days','Credential','HtmlPath',
                      'JsonPath','Verify','PassThru','NonInteractive')) {
             $forward[$k] = $PSBoundParameters[$k]
         }

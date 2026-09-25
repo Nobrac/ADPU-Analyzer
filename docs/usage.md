@@ -9,6 +9,12 @@
 .\ADPU-Analyzer.ps1 -Credential (Get-Credential) -Domain corp.example.net -HtmlPath .\report.html
 ```
 
+To check single accounts — admins or not — before adding them:
+
+```powershell
+.\ADPU-Analyzer.ps1 -Identity alice, 'CORP\bob', 'S-1-5-21-...-1105' -Days 30
+```
+
 On a multi-domain forest the startup prompt lets you pick one, several, or all domains. Parameters work directly on the script; dot-sourcing also works if you would rather call the functions yourself:
 
 ```powershell
@@ -27,6 +33,7 @@ Invoke-ADPUAnalyzer -Domain corp.example.net
 | `-Scope Core\|Extended` | Which groups count as privileged. Default `Core`. |
 | `-IncludeGroup <string[]>` | Extra groups to fold in, by SID or by name. |
 | `-StrictScope` | Leave out privileged members homed in a domain that is not in scope. |
+| `-Identity <string[]>` | Review exactly these accounts instead of the privileged group set — by SID, `sAMAccountName`, `DOMAIN\name` or UPN. They do not have to be admins; a group name reviews its members. Without `-Domain`, all domains are searched. |
 | `-BreakGlass <string[]>` | Emergency admin accounts to keep outside the group on purpose — by SID, `sAMAccountName` or `DOMAIN\name`. The built-in Administrator (RID 500) always counts. |
 | `-Days <int>` | How far back the log harvest reaches. Default `7`; at least `14` for a *Proven* verdict. |
 | `-Credential <pscredential>` | Credentials for forest and controller discovery, every directory read, and the remote log reads. From a machine outside the domain, also pass `-Domain`. |
