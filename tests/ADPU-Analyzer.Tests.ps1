@@ -336,9 +336,9 @@ Assert-Equal $r.frank.Confidence 'Unknown' 'no auditing at all: Unknown'
 # ---------------------------------------------------------------------------
 # 6. Out-of-scope members and evidence scoping
 # ---------------------------------------------------------------------------
-$home1 = New-TestAccount -Sam 'admin' -Rid 1107
-$away  = New-TestAccount -Sam 'admin' -Rid 2107 -Domain 'child.example.net' -DomainSid $domSid2 -Foreign $true
-$ntlm  = @{ Account = 'admin'; Count = 1; Succeeded = 1; Failed = 0; Last = (Get-Date); Sources = @(); FailedSources = @() }
+$home1 = New-TestAccount -Sam 'sameName' -Rid 1107
+$away  = New-TestAccount -Sam 'sameName' -Rid 2107 -Domain 'child.example.net' -DomainSid $domSid2 -Foreign $true
+$ntlm  = @{ Account = 'sameName'; Count = 1; Succeeded = 1; Failed = 0; Last = (Get-Date); Sources = @(); FailedSources = @() }
 $t = New-TestTopology -Domains (New-TestDomain) -Accounts @($home1, $away) `
         -Dcs (New-TestDc -Ntlm4776 $ntlm -Kerb (New-KerbRecord -Sid $home1.Sid))
 $null = Set-ADPUReadiness -Topology $t
@@ -375,7 +375,7 @@ $accs = @(
     (New-TestAccount -Sam 'dave' -Rid 1104 -Enabled $false),
     (New-TestAccount -Sam 'Administrator' -Rid 500),
     (New-TestAccount -Sam 'ivan' -Rid 1111),
-    (New-TestAccount -Sam 'admin' -Rid 2107 -Domain 'child.example.net' -DomainSid $domSid2 -Foreign $true)
+    (New-TestAccount -Sam 'sameName' -Rid 2107 -Domain 'child.example.net' -DomainSid $domSid2 -Foreign $true)
 )
 $dcs = @(
     (New-TestDc -Kerb @((New-KerbRecord -Sid $accs[0].Sid), (New-KerbRecord -Sid $accs[1].Sid -WeakNew 1)) `
@@ -399,7 +399,7 @@ try {
     Assert-True ($page -match 'Kept outside on purpose') 'HTML has the break-glass section'
     Assert-True ($page -match 'row cap') 'HTML shows controller notes'
     $hintsSection = ($page -split '<h2>Hardening hints')[1]
-    Assert-True ($hintsSection -notmatch 'admin') 'HTML hardening hints leave out out-of-scope members'
+    Assert-True ($hintsSection -notmatch 'sameName') 'HTML hardening hints leave out out-of-scope members'
 
     $null = Export-ADPUJsonReport -Topology $t -Path $json
     $obj = Get-Content -LiteralPath $json -Raw | ConvertFrom-Json
