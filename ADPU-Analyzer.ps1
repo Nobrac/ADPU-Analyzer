@@ -1,4 +1,4 @@
-#  ADPU-Analyzer
+﻿#  ADPU-Analyzer
 #  -------------
 #  Reviews an Active Directory forest and works out which privileged accounts
 #  can safely be placed into the Protected Users group - and which still have a
@@ -14,6 +14,7 @@
 #    .\ADPU-Analyzer.ps1 -HtmlPath .\report.html -JsonPath .\report.json
 #    .\ADPU-Analyzer.ps1 -Scope Extended               widen the privileged set
 #    .\ADPU-Analyzer.ps1 -Days 30                      widen the log window
+#    .\ADPU-Analyzer.ps1 -BreakGlass 'CORP\emergency'   keep an emergency admin out
 #    .\ADPU-Analyzer.ps1 -Verify -Days 7               after enrolling: read the
 #                                                      Protected Users channels
 #    .\ADPU-Analyzer.ps1 -NonInteractive -JsonPath .\r.json    for scheduled runs
@@ -52,6 +53,11 @@ param(
     # are listed - a foreign admin in your domain is worth knowing about - but
     # this leaves them out entirely.
     [switch]$StrictScope,
+
+    # Emergency admin accounts to keep outside Protected Users on purpose, by
+    # SID, sAMAccountName or DOMAIN\name. The built-in Administrator (RID 500)
+    # is always treated this way.
+    [string[]]$BreakGlass,
 
     # How far back the log harvest reaches.
     [ValidateRange(1, 365)]
@@ -506,7 +512,12 @@ function Get-FieldMap {
     # $Cache is passed in rather than reached for: which scope $script: resolves
     # to inside a remote runspace is not worth betting the harvest on.
     param($Record, [hashtable]$Spec, [hashtable]$Cache)
-    $key = '{0}/{1}' -f $Record.Id, $Record.Version
+    # The property count is part of the key: the January 2025 update added
+    # fields to 4768 without it being safe to assume the schema version moved,
+    # and a map built for the short layout would read the long one wrongly.
+    $count = 0
+    try { $count = @($Record.Properties).Count } catch { }
+    $key = '{0}/{1}/{2}' -f $Record.Id, $Record.Version, $count
     if ($Cache.ContainsKey($key)) { return $Cache[$key] }
 
     $names = @()
@@ -514,6 +525,9 @@ function Get-FieldMap {
         $xml = [xml]$Record.ToXml()
         foreach ($d in @($xml.Event.EventData.Data)) { $names += [string]$d.GetAttribute('Name') }
     } catch { }
+    # A record that could not be parsed must not poison the cache for every
+    # later event of the same shape - hand back an empty map, uncached.
+    if (-not $names.Count) { return @{} }
 
     # Resolve each logical field to the FIRST matching element. Order matters:
     # 4768 repeats MSDS-SupportedEncryptionTypes and Available Keys for the
@@ -534,8 +548,14 @@ function Get-EventRows {
         [string]$Xpath,
         [hashtable]$Spec,
         [hashtable]$Cache,
-        [int]$Max = 500000
+        [int]$Max = 500000,
+        # Filled in for the caller: Truncated when the $Max cap was hit, ReadError
+        # when the reader failed part-way. Either one means the rows are
+        # incomplete, and the caller must not treat the source as fully read.
+        [hashtable]$Status = @{}
     )
+    $Status.Truncated = $false
+    $Status.ReadError = $null
     $out = [System.Collections.Generic.List[hashtable]]::new()
     $reader = $null
     try {
@@ -551,7 +571,10 @@ function Get-EventRows {
         while ($null -ne ($e = $reader.ReadEvent())) {
             try {
                 $map = Get-FieldMap -Record $e -Spec $Spec -Cache $Cache
-                $row = @{ Time = $e.TimeCreated; Id = [int]$e.Id; Version = [int]$e.Version }
+                # Mapped lists the logical fields this event's schema actually
+                # carries - "absent from the schema" and "present but empty" are
+                # different answers, and the 4768 logic depends on telling them apart.
+                $row = @{ Time = $e.TimeCreated; Id = [int]$e.Id; Version = [int]$e.Version; Mapped = @($map.Keys) }
                 foreach ($logical in $Spec.Keys) {
                     $row[$logical] = if ($map.ContainsKey($logical)) {
                         [string]$e.Properties[$map[$logical]].Value
@@ -561,10 +584,18 @@ function Get-EventRows {
             } catch { }
             $e.Dispose()
             $seen++
-            if ($seen -ge $Max) { break }
+            if ($seen -ge $Max) {
+                # Only truncated if there really was more to read.
+                $next = $null
+                try { $next = $reader.ReadEvent() } catch { }
+                if ($null -ne $next) { $Status.Truncated = $true; $next.Dispose() }
+                break
+            }
         }
     } catch {
-        # reading past the end / access trouble: keep what we already have
+        # Keep what we already have, but say that it is not everything: a silent
+        # stop here used to look exactly like a complete, clean harvest.
+        $Status.ReadError = $_.Exception.Message
     } finally {
         try { $reader.Dispose() } catch { }
     }
@@ -600,6 +631,34 @@ if ($dropped.Count) {
     $notes.Add("$($dropped.Count) account name(s) contain an apostrophe and were left out of the 4776 filter")
 }
 
+# 4776 records the name the way the client sent it. Whether the Event XPath
+# equality test ignores case is not something to bet coverage on, so the filter
+# carries the stored spelling plus its lower- and upper-case forms. That covers
+# "admin" / "ADMIN" / "Admin"; the results are folded to lower case afterwards.
+$nameSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+foreach ($n in $safeNames) {
+    [void]$nameSet.Add($n)
+    [void]$nameSet.Add($n.ToLowerInvariant())
+    [void]$nameSet.Add($n.ToUpperInvariant())
+}
+$filterNames = @($nameSet)
+
+# Which sources were only partly read. A harvest that hit the row cap or lost
+# its reader half-way has findings, but its "nothing found" is not trustworthy.
+$partial = @{ Logon = $false; KerbAS = $false; CredVal = $false }
+
+function Test-HarvestComplete {
+    param([hashtable]$Status, [string]$What, [string]$Key, [hashtable]$Partial, $Notes)
+    if ($Status.Truncated) {
+        $Partial[$Key] = $true
+        $Notes.Add("$What stopped at the row cap - the harvest is incomplete; narrow -Days or check the log volume")
+    }
+    if ($Status.ReadError) {
+        $Partial[$Key] = $true
+        $Notes.Add("$What stopped early ($($Status.ReadError)) - the harvest is incomplete")
+    }
+}
+
 # ------------------------------------------------------------------- 4624: NTLM
 # NTLM logon recorded *at this controller*. Compare the named field directly: the
 # looser two-clause form could match a different field holding the same text.
@@ -610,7 +669,8 @@ if ($onLogon) {
         foreach ($chunk in (Split-Chunk $TargetSids)) {
             $x = "*[EventData[Data[@Name='AuthenticationPackageName']='NTLM'][{0}]]" -f (New-OrClause 'TargetUserSid' $chunk) +
                  "[System[(EventID=4624) and TimeCreated[timediff(@SystemTime) <= $span]]]"
-            foreach ($r in (Get-EventRows -Log 'Security' -Xpath $x -Spec $spec -Cache $fieldMaps)) {
+            $st = @{}
+            foreach ($r in (Get-EventRows -Log 'Security' -Xpath $x -Spec $spec -Cache $fieldMaps -Status $st)) {
                 $sid = [string]$r.Sid
                 if (-not $sid -or $sid -eq 'S-1-0-0') { continue }
                 if ($ntlm4624.ContainsKey($sid)) {
@@ -620,6 +680,7 @@ if ($onLogon) {
                     $ntlm4624[$sid] = @{ Sid = $sid; Account = [string]$r.Name; Count = 1; Last = $r.Time }
                 }
             }
+            Test-HarvestComplete -Status $st -What '4624 harvest' -Key 'Logon' -Partial $partial -Notes $notes
         }
     } catch {
         $onLogon = $false
@@ -634,36 +695,47 @@ if ($onLogon) {
 # NTLM against a member server or workstation reaches the controller as 4776
 # instead. 4776 carries no SID, only the bare account name - which is unique
 # inside a domain, so the caller matches it per domain.
+#
+# Successes and failures are counted apart. A failed validation is somebody
+# *trying* NTLM with this name - a stale service, or a password spray - and only
+# a successful one proves that something really depends on NTLM for this account.
 $ntlm4776 = @{}
 if ($onCredVal) {
     $spec = @{ Name = '^TargetUserName$'; Status = '^Status$'; Workstation = '^Workstation$' }
     try {
-        foreach ($chunk in (Split-Chunk $safeNames)) {
+        foreach ($chunk in (Split-Chunk $filterNames)) {
             $x = "*[EventData[{0}]]" -f (New-OrClause 'TargetUserName' $chunk) +
                  "[System[(EventID=4776) and TimeCreated[timediff(@SystemTime) <= $span]]]"
-            foreach ($r in (Get-EventRows -Log 'Security' -Xpath $x -Spec $spec -Cache $fieldMaps)) {
+            $st = @{}
+            foreach ($r in (Get-EventRows -Log 'Security' -Xpath $x -Spec $spec -Cache $fieldMaps -Status $st)) {
                 $nm = ([string]$r.Name)
                 if (-not $nm) { continue }
                 $key = $nm.ToLowerInvariant()
                 $ok  = (([string]$r.Status) -match '^0x0+$')
-                if ($ntlm4776.ContainsKey($key)) {
-                    $ntlm4776[$key].Count++
-                    if ($ok) { $ntlm4776[$key].Succeeded++ }
-                    if ($r.Time -gt $ntlm4776[$key].Last) { $ntlm4776[$key].Last = $r.Time }
-                    $w = [string]$r.Workstation
-                    if ($w -and $ntlm4776[$key].Sources -notcontains $w -and $ntlm4776[$key].Sources.Count -lt 8) {
-                        $ntlm4776[$key].Sources += $w
-                    }
-                } else {
+                $w   = [string]$r.Workstation
+                if (-not $ntlm4776.ContainsKey($key)) {
                     $ntlm4776[$key] = @{
-                        Account   = $nm
-                        Count     = 1
-                        Succeeded = [int]$ok
-                        Last      = $r.Time
-                        Sources   = @([string]$r.Workstation | Where-Object { $_ })
+                        Account       = $nm
+                        Count         = 0
+                        Succeeded     = 0
+                        Failed        = 0
+                        Last          = $r.Time
+                        Sources       = @()
+                        FailedSources = @()
                     }
                 }
+                $h = $ntlm4776[$key]
+                $h.Count++
+                if ($r.Time -gt $h.Last) { $h.Last = $r.Time }
+                if ($ok) {
+                    $h.Succeeded++
+                    if ($w -and $h.Sources -notcontains $w -and $h.Sources.Count -lt 8) { $h.Sources += $w }
+                } else {
+                    $h.Failed++
+                    if ($w -and $h.FailedSources -notcontains $w -and $h.FailedSources.Count -lt 8) { $h.FailedSources += $w }
+                }
             }
+            Test-HarvestComplete -Status $st -What '4776 harvest' -Key 'CredVal' -Partial $partial -Notes $notes
         }
     } catch {
         $onCredVal = $false
@@ -674,77 +746,136 @@ if ($onCredVal) {
 }
 
 # ---------------------------------------------------- 4768: etypes and AES keys
-# Two things come out of the same pass:
-#   * whether the account was issued a non-AES ticket/session key
-#   * which long-term keys AD holds for it ("Available Keys")
-# The second is the interesting one: it is direct proof that AES keys exist,
-# rather than the password-age guess the rest of the tool has to fall back on.
-# Both of the new fields only appear on Server 2019+, or Server 2016 with the
-# January 2025 cumulative update - which is what Version >= 2 tells us.
-$kerb    = @{}
-$maxVer  = -1
+# Which fields mean what:
+#   * TicketEncryptionType is the encryption of the TGT itself. The KDC picks it
+#     from the *krbtgt* account's keys, so it says nothing about the account that
+#     asked - on any build.
+#   * SessionKeyEncryptionType (and the pre-auth type, where the build reports
+#     one) is what the client and the KDC actually negotiated. That is the value
+#     that tells us whether this account still uses DES/RC4.
+#   * AccountAvailableKeys lists the long-term keys AD holds for the account -
+#     direct proof that AES keys exist, rather than the password-age guess.
+#   * ClientAdvertizedEncryptionTypes is what the requesting client offered.
+# The newer fields exist on Server 2019+, or Server 2016 with the January 2025
+# cumulative update. Whether an event has them is decided per event, from the
+# fields its schema actually carries - not from a version number.
+function Test-WeakEtype {
+    # $null = no usable value, $false = AES, $true = anything weaker.
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $v = $Value.Trim()
+    if ($v -match '^-$' -or $v -match '^0x[fF]+$') { return $null }       # sentinel on failures
+    if ($v -match '^0x0*1[12]$' -or $v -match '^(17|18)$') { return $false } # AES128 / AES256
+    if ($v -match 'AES') { return $false }
+    $true
+}
+
+function Test-AesMask {
+    # Reads a key list or an etype list: hex mask or text. $null when empty.
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $v = $Value.Trim()
+    if ($v -match '^-?$') { return $null }
+    if ($v -match '^0x[0-9a-fA-F]+$') { return ((([Convert]::ToInt64($v, 16)) -band 0x18) -ne 0) }
+    ($v -match 'AES')
+}
+
+# The schema, straight from the provider manifest: this answers "does this
+# controller report the new fields" even when none of our accounts happened to
+# request a TGT during the window.
+$schemaNew = $null
+try {
+    $meta = [Diagnostics.Eventing.Reader.ProviderMetadata]::new('Microsoft-Windows-Security-Auditing')
+    $tpl  = @($meta.Events | Where-Object { $_.Id -eq 4768 } | ForEach-Object { [string]$_.Template })
+    if ($tpl.Count) { $schemaNew = [bool](@($tpl | Where-Object { $_ -match 'AccountAvailableKeys|SessionKeyEncryptionType' }).Count) }
+} catch { }
+
+$kerb        = @{}
+$maxVer      = -1
+$observedNew = $false
 if ($onKerb) {
     $spec = @{
-        Sid     = '^TargetSid$'
-        Name    = '^TargetUserName$'
-        Ticket  = '^TicketEncryptionType$'
-        Session = '^SessionEncryptionType$'
-        Keys    = 'AvailableKeys'
-        Etypes  = 'SupportedEncryptionTypes'
-        Status  = '^Status$'
+        Sid        = '^TargetSid$'
+        Name       = '^TargetUserName$'
+        Ticket     = '^TicketEncryptionType$'
+        Session    = '^SessionKeyEncryptionType$'
+        PreAuth    = '^PreAuthEncryptionType$'
+        Keys       = '^AccountAvailableKeys$'
+        Etypes     = '^AccountSupportedEncryptionTypes$'
+        Advertized = '^ClientAdvertizedEncryptionTypes$'
+        Client     = '^IpAddress$'
+        Status     = '^Status$'
     }
     try {
         foreach ($chunk in (Split-Chunk $TargetSids)) {
             $x = "*[EventData[{0}]]" -f (New-OrClause 'TargetSid' $chunk) +
                  "[System[(EventID=4768) and TimeCreated[timediff(@SystemTime) <= $span]]]"
-            foreach ($r in (Get-EventRows -Log 'Security' -Xpath $x -Spec $spec -Cache $fieldMaps)) {
+            $st = @{}
+            foreach ($r in (Get-EventRows -Log 'Security' -Xpath $x -Spec $spec -Cache $fieldMaps -Status $st)) {
                 $sid = [string]$r.Sid
                 if (-not $sid -or $sid -eq 'S-1-0-0') { continue }
                 if ([int]$r.Version -gt $maxVer) { $maxVer = [int]$r.Version }
 
-                # A failed AS-REQ carries no usable etype (0xFFFFFFFF) - it says
-                # nothing about what the account can do, so it is not evidence.
+                $mapped = @($r.Mapped)
+                $isNew  = ($mapped -contains 'Session') -or ($mapped -contains 'Keys')
+                if ($isNew) { $observedNew = $true }
+
+                # A failed AS-REQ carries no usable etype - it says nothing about
+                # what the account can do, so it is not evidence either way.
                 $failed = (([string]$r.Status) -and ([string]$r.Status) -notmatch '^0x0+$')
 
-                $weak = $false
-                foreach ($v in @([string]$r.Ticket, [string]$r.Session)) {
-                    if (-not $v) { continue }
-                    if ($v -match '^0x[fF]+$') { continue }        # sentinel on failures
-                    if ($v -match '^0x0*1[12]$') { continue }      # 0x11/0x12 = AES128/AES256
-                    $weak = $true
-                }
-                if ($failed) { $weak = $false }
-
-                $keys   = [string]$r.Keys
-                $hasAes = $null
-                if ($keys) {
-                    if ($keys -match '^\s*0x[0-9a-fA-F]+\s*$') {
-                        $hasAes = ((([Convert]::ToInt32($keys.Trim(), 16)) -band 0x18) -ne 0)
-                    } elseif ($keys -notmatch '^\s*-?\s*$') {
-                        $hasAes = ($keys -match 'AES')
+                $weakNew    = $false
+                $weakLegacy = $false
+                if (-not $failed) {
+                    if ($isNew) {
+                        foreach ($v in @([string]$r.Session, [string]$r.PreAuth)) {
+                            if ((Test-WeakEtype $v) -eq $true) { $weakNew = $true }
+                        }
+                    } else {
+                        # Legacy layout: the ticket type is all there is. It is the
+                        # krbtgt's choice, so the scorer discards it whenever krbtgt
+                        # is known to permit no AES.
+                        if ((Test-WeakEtype ([string]$r.Ticket)) -eq $true) { $weakLegacy = $true }
                     }
                 }
 
-                if ($kerb.ContainsKey($sid)) {
-                    $kerb[$sid].Count++
-                    if ($weak) { $kerb[$sid].Weak++ }
-                    if ($null -ne $hasAes) { $kerb[$sid].HasAes = ($kerb[$sid].HasAes -or $hasAes); $kerb[$sid].KeysSeen = $true }
-                    if ($r.Time -gt $kerb[$sid].Last) { $kerb[$sid].Last = $r.Time }
-                    if ($keys) { $kerb[$sid].Keys = $keys }
-                } else {
+                $keys   = if ($isNew) { [string]$r.Keys } else { $null }
+                $hasAes = Test-AesMask $keys
+                $adv    = if ($isNew -and -not $failed) { Test-AesMask ([string]$r.Advertized) } else { $null }
+                $client = ([string]$r.Client) -replace '^::ffff:', ''
+
+                if (-not $kerb.ContainsKey($sid)) {
                     $kerb[$sid] = @{
-                        Sid      = $sid
-                        Account  = [string]$r.Name
-                        Count    = 1
-                        Weak     = [int]$weak
-                        HasAes   = [bool]$hasAes
-                        KeysSeen = ($null -ne $hasAes)
-                        Keys     = $keys
-                        Etypes   = [string]$r.Etypes
-                        Last     = $r.Time
+                        Sid          = $sid
+                        Account      = [string]$r.Name
+                        Count        = 0
+                        NewEvents    = 0
+                        Weak         = 0
+                        WeakNew      = 0
+                        WeakLegacy   = 0
+                        HasAes       = $false
+                        KeysSeen     = $false
+                        Keys         = $null
+                        Etypes       = [string]$r.Etypes
+                        NoAesAdv     = 0
+                        AdvSources   = @()
+                        Last         = $r.Time
                     }
                 }
+                $k = $kerb[$sid]
+                $k.Count++
+                if ($isNew)      { $k.NewEvents++ }
+                if ($weakNew)    { $k.WeakNew++;    $k.Weak++ }
+                if ($weakLegacy) { $k.WeakLegacy++; $k.Weak++ }
+                if ($null -ne $hasAes) { $k.HasAes = ($k.HasAes -or $hasAes); $k.KeysSeen = $true }
+                if ($keys) { $k.Keys = $keys }
+                if ($adv -eq $false) {
+                    $k.NoAesAdv++
+                    if ($client -and $client -ne '-' -and $k.AdvSources -notcontains $client -and $k.AdvSources.Count -lt 8) { $k.AdvSources += $client }
+                }
+                if ($r.Time -gt $k.Last) { $k.Last = $r.Time }
             }
+            Test-HarvestComplete -Status $st -What '4768 harvest' -Key 'KerbAS' -Partial $partial -Notes $notes
         }
     } catch {
         $onKerb = $false
@@ -791,10 +922,12 @@ try {
         KerbAS  = $aud.KerbAS.Text
         CredVal = $aud.CredVal.Text
     }
+    AuditPartial  = $partial
     Ntlm4624      = @($ntlm4624.Values)
     Ntlm4776      = @($ntlm4776.Values)
     KerbSeen      = @($kerb.Values)
     Kerb4768Ver   = $maxVer
+    Kerb4768New   = [bool](($schemaNew -eq $true) -or $observedNew)
     KdcRc4        = @($kdcRc4.Values)
     Notes         = @($notes)
 }
@@ -830,7 +963,11 @@ function Get-ADPUControllerFacts {
     $guids = @{}
     foreach ($k in $script:ADPUAuditGuid.Keys) { $guids[$k] = $script:ADPUAuditGuid[$k] }
 
-    $option = New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 900000 -CancelTimeout 5000
+    # The operation timeout grows with the window: a year of Security log on a
+    # busy controller can take far longer than a week, and a timeout would show
+    # up as "unreachable" rather than "slow". 15 minutes floor, one hour ceiling.
+    $opTimeout = [int][Math]::Min(3600000, 900000 + ([int64]$Days * 10000))
+    $option = New-PSSessionOption -OpenTimeout 20000 -OperationTimeout $opTimeout -CancelTimeout 5000
 
     $work = {
         param($names, $src, $days, $guids, $sids, $accounts, $cred, $option, $throttle)
@@ -910,30 +1047,101 @@ $script:ADPUGroupCatalog = @(
     [pscustomobject]@{ Label = 'DnsAdmins';                   Sid = $null;          Rid = $null; Name = 'DnsAdmins';  Tier = 'Extended'; Level = 'Domain' }
 )
 
-function Get-ADPUDomainSid {
+function Get-ADPUDirectoryContext {
     <#
-        Works out a domain's SID without needing RSAT: translate DOMAIN\krbtgt to a
-        SID and lop off the trailing -502 RID. krbtgt always exists, so this is a
-        reliable anchor.
+        A DirectoryContext that carries -Credential when one was given. Every
+        System.DirectoryServices.ActiveDirectory call (forest, domain, controller
+        discovery) goes through here, so a run from a machine outside the domain
+        uses the supplied account throughout rather than only for some of it.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)] $DomainName)
-
-    $krbtgt = [Security.Principal.NTAccount]::new($DomainName, 'krbtgt').
-                  Translate([Security.Principal.SecurityIdentifier]).Value
-    [Security.Principal.SecurityIdentifier]::new($krbtgt.Substring(0, $krbtgt.Length - 4))
+    param(
+        [Parameter(Mandatory)] [DirectoryServices.ActiveDirectory.DirectoryContextType]$Type,
+        [string]$Name,
+        [pscredential]$Credential
+    )
+    if ($Credential) {
+        $user = $Credential.UserName
+        $pass = $Credential.GetNetworkCredential().Password
+        if ($Name) { [DirectoryServices.ActiveDirectory.DirectoryContext]::new($Type, $Name, $user, $pass) }
+        else       { [DirectoryServices.ActiveDirectory.DirectoryContext]::new($Type, $user, $pass) }
+    } else {
+        if ($Name) { [DirectoryServices.ActiveDirectory.DirectoryContext]::new($Type, $Name) }
+        else       { [DirectoryServices.ActiveDirectory.DirectoryContext]::new($Type) }
+    }
 }
+
+function Get-ADPUForest {
+    <#
+        Finds the forest to review. Without credentials that is simply the current
+        forest. With credentials, it is reached through a named domain when one is
+        known (works from a machine that is not joined at all), and otherwise
+        through the machine's own forest, but bound with the supplied account.
+    #>
+    [CmdletBinding()]
+    param([string[]]$DomainName, [pscredential]$Credential)
+
+    if (-not $Credential) { return [DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest() }
+    $first = @($DomainName | Where-Object { $_ }) | Select-Object -First 1
+    if ($first) {
+        $ctx = Get-ADPUDirectoryContext -Type Domain -Name $first -Credential $Credential
+        return ([DirectoryServices.ActiveDirectory.Domain]::GetDomain($ctx)).Forest
+    }
+    $ctx = Get-ADPUDirectoryContext -Type Forest -Credential $Credential
+    [DirectoryServices.ActiveDirectory.Forest]::GetForest($ctx)
+}
+
+# One PrincipalContext per domain (and credential), reused for the whole run and
+# disposed at the end. Building a fresh one for every lookup opened a new LDAP
+# bind each time and never released any of them.
+$script:ADPUContextCache = @{}
 
 function Get-ADPUPrincipalContext {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string]$DomainName, [pscredential]$Credential)
 
-    if ($Credential) {
+    $key = '{0}|{1}' -f $DomainName.ToLowerInvariant(), $(if ($Credential) { $Credential.UserName } else { '' })
+    if ($script:ADPUContextCache.ContainsKey($key)) { return $script:ADPUContextCache[$key] }
+
+    $ctx = if ($Credential) {
         [DirectoryServices.AccountManagement.PrincipalContext]::new(
             'Domain', $DomainName, $Credential.UserName, $Credential.GetNetworkCredential().Password)
     } else {
         [DirectoryServices.AccountManagement.PrincipalContext]::new('Domain', $DomainName)
     }
+    $script:ADPUContextCache[$key] = $ctx
+    $ctx
+}
+
+function Clear-ADPUContextCache {
+    # Called once the run is over - principals read through a context stay usable
+    # only while it is open, so this must not happen any earlier.
+    foreach ($ctx in @($script:ADPUContextCache.Values)) { try { $ctx.Dispose() } catch { } }
+    $script:ADPUContextCache = @{}
+}
+
+function Get-ADPUDomainSid {
+    <#
+        Works out a domain's SID without needing RSAT: look up the domain's krbtgt
+        account and take its account-domain SID. krbtgt always exists, so this is
+        a reliable anchor. Goes through the (credentialled) principal context
+        first; the NTAccount translation is only a fallback, because it always
+        runs as the current user.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $DomainName, [pscredential]$Credential)
+
+    try {
+        $ctx  = Get-ADPUPrincipalContext -DomainName ([string]$DomainName) -Credential $Credential
+        $user = [DirectoryServices.AccountManagement.UserPrincipal]::FindByIdentity($ctx, 'krbtgt')
+        if ($user -and $user.Sid -and $user.Sid.AccountDomainSid) { return $user.Sid.AccountDomainSid }
+    } catch {
+        if ($Credential) { throw }
+    }
+
+    $krbtgt = [Security.Principal.NTAccount]::new($DomainName, 'krbtgt').
+                  Translate([Security.Principal.SecurityIdentifier]).Value
+    [Security.Principal.SecurityIdentifier]::new($krbtgt.Substring(0, $krbtgt.Length - 4))
 }
 
 function Resolve-ADPUGroupIdentity {
@@ -1032,11 +1240,11 @@ function Get-ADPUKrbtgtHealth {
             Checks whether the domain's krbtgt account has AES keys.
         .DESCRIPTION
             Worth one lookup per domain, because it changes how the DES/RC4 findings
-            must be read. Historically the Ticket Encryption Type in event 4768 was
-            the encryption of the TGT itself, which the KDC picks from the krbtgt
-            account's keys - so a krbtgt without AES makes *every* account in the
-            domain look like an RC4 user. That is a domain problem to fix once, not
-            a blocker on each individual account.
+            must be read. The Ticket Encryption Type in event 4768 is the encryption
+            of the TGT itself, which the KDC picks from the krbtgt account's keys -
+            so a krbtgt without AES makes *every* account in the domain look like an
+            RC4 user wherever that field is all there is. That is a domain problem
+            to fix once, not a blocker on each individual account.
     #>
     [CmdletBinding()]
     param(
@@ -1090,6 +1298,10 @@ $script:ADPUModernServerPattern = '^Windows Server (2012 R2|201[6-9]|20[2-9]\d)\
 
 # Functional-level 6 == Server 2012 R2, the floor for the Protected Users group.
 $script:ADPUFunctionalFloor = 6
+
+# Below this many days of logs no account is rated "Proven", however clean: a
+# weekly batch job or a monthly VPN sign-in can hide inside a shorter window.
+$script:ADPUProvenMinDays = 14
 
 function ConvertTo-ADPUAccount {
     <#
@@ -1224,7 +1436,7 @@ function Get-ADPUTopology {
 
     # -- forest -----------------------------------------------------------------
     Write-ADPULine note 'Mapping the forest...'
-    $forest   = [DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
+    $forest   = Get-ADPUForest -DomainName $DomainName -Credential $Credential
     $rootName = [string]$forest.RootDomain.Name
 
     # -- domains ----------------------------------------------------------------
@@ -1248,7 +1460,7 @@ function Get-ADPUTopology {
         # throws, which used to abort the whole run instead of skipping the domain.
         try {
             $null = $d.Forest
-            $sid  = Get-ADPUDomainSid -DomainName $d.Name
+            $sid  = Get-ADPUDomainSid -DomainName $d.Name -Credential $Credential
         } catch {
             Write-ADPULine warn "$($d.Name) is out of reach - leaving it out of the review."
             continue
@@ -1338,7 +1550,7 @@ function Get-ADPUTopology {
     Write-ADPULine note 'Reaching the controllers...'
     $controllers = foreach ($d in $domains) {
         try {
-            $ctx    = [DirectoryServices.ActiveDirectory.DirectoryContext]::new(0, $d.Name)
+            $ctx    = Get-ADPUDirectoryContext -Type Domain -Name $d.Name -Credential $Credential
             $dcList = @([DirectoryServices.ActiveDirectory.DomainController]::FindAll($ctx))
         } catch {
             Write-ADPULine warn "Could not enumerate the controllers of $($d.Name) - skipping them."
@@ -1362,6 +1574,7 @@ function Get-ADPUTopology {
                 AuditRaw       = @{ Logon = $null; KerbAS = $null; CredVal = $null }
                 AuditMethod    = 'not read'
                 NewKerbFields  = $false
+                AuditPartial   = @{ Logon = $false; KerbAS = $false; CredVal = $false }
                 Ntlm4624       = @()
                 Ntlm4776       = @()
                 KerbSeen       = @()
@@ -1387,10 +1600,17 @@ function Get-ADPUTopology {
                 $dc.AuditState     = $f.AuditState
                 $dc.AuditRaw       = $f.AuditRaw
                 $dc.AuditMethod    = [string]$f.AuditMethod
-                # Version 2 of event 4768 is what carries "Available Keys" and the
-                # session-key encryption type. Older controllers report the TGT's
-                # own encryption instead, which says nothing about the client.
-                $dc.NewKerbFields  = ([int]$f.Kerb4768Ver -ge 2)
+                # Whether 4768 carries "Available Keys" and the session-key type
+                # is read from the controller's own event manifest (and from the
+                # events themselves), not inferred from a version number.
+                $dc.NewKerbFields  = [bool]$f.Kerb4768New
+                if ($f.AuditPartial) {
+                    $dc.AuditPartial = @{
+                        Logon   = [bool]$f.AuditPartial.Logon
+                        KerbAS  = [bool]$f.AuditPartial.KerbAS
+                        CredVal = [bool]$f.AuditPartial.CredVal
+                    }
+                }
                 $dc.Ntlm4624       = @($f.Ntlm4624)
                 $dc.Ntlm4776       = @($f.Ntlm4776)
                 $dc.KerbSeen       = @($f.KerbSeen)
@@ -1436,6 +1656,20 @@ $script:ADPUSideEffects = @(
     'CredSSP and WDigest no longer store the credential in plaintext - tooling that depends on credential delegation breaks.'
     'Protections apply from the next fresh logon. An existing session or ticket can hide the problem for hours.'
 )
+
+function Get-ADPUField {
+    # Reads a field that an older collector may not have sent. Hashtables and
+    # objects both come back from remoting, and under strict mode a missing key or
+    # property is an error rather than $null - so look before reaching.
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        return $null
+    }
+    $p = $Object.PSObject.Properties[$Name]
+    if ($p) { $p.Value } else { $null }
+}
 
 function New-ADPUFinding {
     param([string]$Code, [ValidateSet('bad','warn')] [string]$Severity, [string]$Text)
@@ -1495,15 +1729,24 @@ function Set-ADPUReadiness {
             foreach ($h in @($dc.Ntlm4776)) {
                 if (-not $h.Account) { continue }
                 $k = ([string]$h.Account).ToLowerInvariant()
-                if ($credNm.ContainsKey($k)) {
-                    $credNm[$k].Count += [int]$h.Count
-                    if ($h.Last -gt $credNm[$k].Last) { $credNm[$k].Last = $h.Last }
-                    $credNm[$k].Sources = @(@($credNm[$k].Sources) + @($h.Sources) | Where-Object { $_ } | Select-Object -Unique)
-                } else {
+                # Older collectors only reported Count/Succeeded; everything that
+                # did not succeed is a failure.
+                $hOk   = Get-ADPUField $h 'Succeeded'
+                $hBad  = Get-ADPUField $h 'Failed'
+                $ok  = if ($null -ne $hOk)  { [int]$hOk }  else { [int]$h.Count }
+                $bad = if ($null -ne $hBad) { [int]$hBad } else { [int]$h.Count - $ok }
+                if (-not $credNm.ContainsKey($k)) {
                     $credNm[$k] = [pscustomobject]@{
-                        Count = [int]$h.Count; Last = $h.Last; Sources = @($h.Sources)
+                        Count = 0; Succeeded = 0; Failed = 0; Last = $h.Last; Sources = @(); FailedSources = @()
                     }
                 }
+                $c = $credNm[$k]
+                $c.Count     += [int]$h.Count
+                $c.Succeeded += $ok
+                $c.Failed    += $bad
+                if ($h.Last -gt $c.Last) { $c.Last = $h.Last }
+                $c.Sources       = @(@($c.Sources) + @($h.Sources) | Where-Object { $_ } | Select-Object -Unique)
+                $c.FailedSources = @(@($c.FailedSources) + @(Get-ADPUField $h 'FailedSources') | Where-Object { $_ } | Select-Object -Unique)
             }
         }
         foreach ($dc in ($dcs | Where-Object { $_.AuditKerbOk })) {
@@ -1512,11 +1755,29 @@ function Set-ADPUReadiness {
                 $k = [string]$h.Sid
                 if (-not $kerb.ContainsKey($k)) {
                     $kerb[$k] = [pscustomobject]@{
-                        Count = 0; Weak = 0; KeysSeen = $false; HasAes = $false; Keys = $null; Last = $null
+                        Count = 0; NewEvents = 0; Weak = 0; WeakNew = 0; WeakLegacy = 0
+                        KeysSeen = $false; HasAes = $false; Keys = $null
+                        NoAesAdv = 0; AdvSources = @(); Last = $null
                     }
                 }
-                $kerb[$k].Count += [int]$h.Count
-                $kerb[$k].Weak  += [int]$h.Weak
+                $kerb[$k].Count     += [int]$h.Count
+                $kerb[$k].NewEvents += [int](Get-ADPUField $h 'NewEvents')
+                $kerb[$k].Weak      += [int]$h.Weak
+                # A record without the split is from the old collector: treat all
+                # of its weak findings as legacy (ticket-field) evidence.
+                $wNew = Get-ADPUField $h 'WeakNew'
+                $wOld = Get-ADPUField $h 'WeakLegacy'
+                if ($null -ne $wNew -or $null -ne $wOld) {
+                    $kerb[$k].WeakNew    += [int]$wNew
+                    $kerb[$k].WeakLegacy += [int]$wOld
+                } else {
+                    $kerb[$k].WeakLegacy += [int]$h.Weak
+                }
+                $kerb[$k].NoAesAdv  += [int](Get-ADPUField $h 'NoAesAdv')
+                $adv = @(Get-ADPUField $h 'AdvSources' | Where-Object { $_ })
+                if ($adv.Count) {
+                    $kerb[$k].AdvSources = @(@($kerb[$k].AdvSources) + $adv | Select-Object -Unique)
+                }
                 if ($h.KeysSeen) { $kerb[$k].KeysSeen = $true; $kerb[$k].HasAes = ($kerb[$k].HasAes -or [bool]$h.HasAes) }
                 if ($h.Keys) { $kerb[$k].Keys = [string]$h.Keys }
                 if ($null -eq $kerb[$k].Last -or $h.Last -gt $kerb[$k].Last) { $kerb[$k].Last = $h.Last }
@@ -1524,10 +1785,12 @@ function Set-ADPUReadiness {
         }
 
         $reachable = @($dcs | Where-Object { $_.Reachable })
-        # A krbtgt without AES makes the DES/RC4 reading unusable on controllers
-        # that still report the TGT's own encryption rather than the session key.
-        $krbtgtBad = ($d.Krbtgt -and $d.Krbtgt.Readable -and $d.Krbtgt.HasAes -eq $false)
-        $anyNew    = [bool](@($reachable | Where-Object { $_.NewKerbFields }).Count)
+        # A krbtgt without AES makes the legacy (ticket-field) DES/RC4 reading
+        # unusable: that field is the TGT's own encryption, chosen from krbtgt's
+        # keys. The session-key reading from newer controllers is unaffected, so
+        # this is decided per finding, not for the whole domain.
+        $krbtgtBad = [bool]($d.Krbtgt -and $d.Krbtgt.Readable -and $d.Krbtgt.HasAes -eq $false)
+        $isPartial = { param($dc, [string]$key) [bool]($dc.AuditPartial -and $dc.AuditPartial[$key]) }
 
         $index[$d.Name.ToLowerInvariant()] = [pscustomobject]@{
             Domain       = $d
@@ -1538,11 +1801,12 @@ function Set-ADPUReadiness {
             KerbDcs      = @($reachable | Where-Object { $_.AuditKerbOk })
             CredValDcs   = @($reachable | Where-Object { $_.AuditCredValOk })
             NewFieldDcs  = @($reachable | Where-Object { $_.NewKerbFields })
+            PartialDcs   = @($reachable | Where-Object {
+                               (& $isPartial $_ 'Logon') -or (& $isPartial $_ 'KerbAS') -or (& $isPartial $_ 'CredVal') })
             NtlmSids     = $ntlmSid
             CredNames    = $credNm
             Kerb         = $kerb
             KrbtgtBad    = $krbtgtBad
-            WeakReliable = ($anyNew -or -not $krbtgtBad)
         }
     }
 
@@ -1551,6 +1815,16 @@ function Set-ADPUReadiness {
         $names = @($list | ForEach-Object { $_.Name } | Sort-Object)
         if ($names.Count -le 3) { $names -join ', ' } else { ($names[0..2] -join ', ') + (' and {0} more' -f ($names.Count - 3)) }
     }
+
+    # Break-glass accounts: kept out of the group on purpose, so that a Protected
+    # Users side effect nobody foresaw cannot lock out every administrator at
+    # once. The built-in Administrator (RID 500) always counts; -BreakGlass adds
+    # more by SID, sAMAccountName or DOMAIN\name.
+    $breakGlass = @()
+    $bgProp = $Topology.PSObject.Properties['BreakGlass']
+    if ($bgProp -and $bgProp.Value) { $breakGlass = @($bgProp.Value | Where-Object { $_ } | ForEach-Object { [string]$_ }) }
+
+    $minProven = [int]$script:ADPUProvenMinDays
 
     foreach ($a in @($Topology.Accounts)) {
         # An out-of-scope account is deliberately given no evidence index. Its
@@ -1564,11 +1838,8 @@ function Set-ADPUReadiness {
         $hints    = [System.Collections.Generic.List[object]]::new()
         $evidence = [System.Collections.Generic.List[object]]::new()
 
-        $isEnrolled = ($a.Sid -and $enrolled.Contains([string]$a.Sid))
-        # Determined up front because the confidence computation reads it. It used
-        # to be set further down, after that read - which strict mode rightly
-        # rejects, and which only happened to work because a foreign account also
-        # takes the "blind" path.
+        $isEnrolled = [bool]($a.Sid -and $enrolled.Contains([string]$a.Sid))
+        # Determined up front because the confidence computation reads it.
         $outOfScope = [bool]$a.Foreign
         $person     = ([string]$a.Class) -match '^(user|iNetOrgPerson)$'
         $uac        = if ($null -ne $a.Uac) { [int]$a.Uac } else { 0 }
@@ -1582,12 +1853,26 @@ function Set-ADPUReadiness {
         $delegates   = @($a.DelegateTo).Count -gt 0
         $noAesEtype  = ($null -ne $a.EncTypes) -and ([int]$a.EncTypes -ne 0) -and ((([int]$a.EncTypes) -band 0x18) -eq 0)
 
+        $isRid500   = [bool]($a.Sid -and ([string]$a.Sid) -match '-500$')
+        $samName    = [string]$a.Sam
+        $qualified  = '{0}\{1}' -f $a.Domain, $a.Sam
+        $listed     = [bool](@($breakGlass | Where-Object {
+                          $_ -ieq [string]$a.Sid -or $_ -ieq $samName -or $_ -ieq $qualified
+                      }).Count)
+        $breakGlassAcct = ($isRid500 -or $listed) -and -not $outOfScope
+
         # -- log evidence, scoped to the account's own domain --------------------
         $kerbRec   = if ($ix -and $a.Sid -and $ix.Kerb.ContainsKey([string]$a.Sid)) { $ix.Kerb[[string]$a.Sid] } else { $null }
         $credRec   = if ($ix -and $a.Sam -and $ix.CredNames.ContainsKey(([string]$a.Sam).ToLowerInvariant())) { $ix.CredNames[([string]$a.Sam).ToLowerInvariant()] } else { $null }
         $didNtlm   = [bool]($ix -and $a.Sid -and $ix.NtlmSids.Contains([string]$a.Sid))
-        $didCred   = [bool]$credRec
-        $didWeak   = [bool]($kerbRec -and $kerbRec.Weak -gt 0)
+        # Only a *successful* NTLM validation proves a dependency. Failures alone
+        # are someone trying the name over NTLM - stale config, or an attack.
+        $didCred   = [bool]($credRec -and [int]$credRec.Succeeded -gt 0)
+        $failCred  = [bool]($credRec -and [int]$credRec.Succeeded -eq 0 -and [int]$credRec.Failed -gt 0)
+        $weakNew    = [bool]($kerbRec -and [int]$kerbRec.WeakNew -gt 0)
+        $weakLegacy = [bool]($kerbRec -and [int]$kerbRec.WeakLegacy -gt 0)
+        $krbtgtBad  = [bool]($ix -and $ix.KrbtgtBad)
+        $didWeak   = $weakNew -or ($weakLegacy -and -not $krbtgtBad)
         $aesProven = [bool]($kerbRec -and $kerbRec.KeysSeen -and $kerbRec.HasAes)
         $aesDenied = [bool]($kerbRec -and $kerbRec.KeysSeen -and -not $kerbRec.HasAes)
 
@@ -1604,6 +1889,11 @@ function Set-ADPUReadiness {
         }
         if (-not $a.PugPresent -and -not $a.Foreign) {
             $blockers.Add((New-ADPUFinding 'NoGroup' 'bad' 'its home domain has no Protected Users group - create it there first (PDC emulator on 2012 R2+)'))
+        }
+        if ($disabled) {
+            # Enrolling a disabled admin achieves nothing; the fix is to take its
+            # privileges away. It used to land in "clear to enrol" with a command.
+            $blockers.Add((New-ADPUFinding 'Disabled' 'bad' 'account is disabled but still sits in an admin group - remove it from the group rather than enrolling it'))
         }
         if ($desOnly) {
             $blockers.Add((New-ADPUFinding 'DesOnly' 'bad' '"use DES encryption types only" is set (userAccountControl 0x200000) - clear the flag and reset the password'))
@@ -1630,21 +1920,31 @@ function Set-ADPUReadiness {
         }
         if ($didCred) {
             $src = if (@($credRec.Sources).Count) { ' from ' + ((@($credRec.Sources) | Select-Object -First 4) -join ', ') } else { '' }
-            $blockers.Add((New-ADPUFinding 'Ntlm4776' 'bad' ('NTLM credential validation (event 4776) {0}x in the last {1} day(s){2} - something in the estate still authenticates this account over NTLM' -f $credRec.Count, $window, $src)))
+            $blockers.Add((New-ADPUFinding 'Ntlm4776' 'bad' ('successful NTLM credential validation (event 4776) {0}x in the last {1} day(s){2} - something in the estate still authenticates this account over NTLM' -f $credRec.Succeeded, $window, $src)))
         }
-        if ($didWeak) {
-            if ($ix -and -not $ix.WeakReliable) {
-                # krbtgt has no AES and no controller reports the new fields: every
-                # account in the domain looks like an RC4 user. Not this account's
-                # fault, and not something to block it on.
-                $hints.Add((New-ADPUFinding 'WeakKerbUnreliable' 'warn' 'a non-AES Kerberos ticket was seen, but this domain''s krbtgt has no AES keys and the controllers do not report the new 4768 fields - the finding is a domain-wide artefact, not evidence about this account'))
+        if ($weakNew) {
+            $blockers.Add((New-ADPUFinding 'WeakKerb' 'bad' ('negotiated a DES/RC4 session key {0}x in the last {1} day(s) (event 4768, session-key field) - fix the cipher usage first' -f $kerbRec.WeakNew, $window)))
+        }
+        if ($weakLegacy) {
+            if ($krbtgtBad) {
+                # The legacy ticket field is the krbtgt's choice. With a krbtgt
+                # that permits no AES, every account looks like an RC4 user.
+                $hints.Add((New-ADPUFinding 'WeakKerbUnreliable' 'warn' 'a non-AES ticket was reported by a controller without the newer 4768 fields, but this domain''s krbtgt permits no AES - the finding is a domain-wide artefact, not evidence about this account'))
             } else {
-                $blockers.Add((New-ADPUFinding 'WeakKerb' 'bad' ('requested DES/RC4 Kerberos {0}x in the last {1} day(s) (event 4768) - fix the cipher usage first' -f $kerbRec.Weak, $window)))
+                $blockers.Add((New-ADPUFinding 'WeakKerbLegacy' 'bad' ('a non-AES Kerberos ticket was reported {0}x in the last {1} day(s) by controller(s) without the newer 4768 fields - weaker evidence (the legacy field is the ticket''s encryption, not the negotiated session key), but not safe to ignore' -f $kerbRec.WeakLegacy, $window)))
             }
         }
 
         # ---- hints (never change the verdict) ----------------------------------
-        if ($a.AdminCount -and -not $isEnrolled) {
+        if ($failCred) {
+            $src = if (@($credRec.FailedSources).Count) { ' from ' + ((@($credRec.FailedSources) | Select-Object -First 4) -join ', ') } else { '' }
+            $hints.Add((New-ADPUFinding 'Ntlm4776Failed' 'warn' ('{0} failed NTLM validation(s) for this name (event 4776){1}, none successful - a stale saved password, or someone trying the account; worth tracking down, but not a dependency' -f $credRec.Failed, $src)))
+        }
+        if ($kerbRec -and [int]$kerbRec.NoAesAdv -gt 0) {
+            $src = if (@($kerbRec.AdvSources).Count) { ' from ' + ((@($kerbRec.AdvSources) | Select-Object -First 4) -join ', ') } else { '' }
+            $hints.Add((New-ADPUFinding 'ClientNoAes' 'warn' ('{0} Kerberos request(s){1} came from a client that offered no AES at all - that client will not be able to sign this account in once it is enrolled' -f $kerbRec.NoAesAdv, $src)))
+        }
+        if ($a.AdminCount -and -not $isEnrolled -and -not $breakGlassAcct) {
             $hints.Add((New-ADPUFinding 'AdminCount' 'warn' 'adminCount=1 but not in Protected Users - a protected admin left outside the group'))
         }
         if ($hasSpn -and $person) {
@@ -1655,7 +1955,9 @@ function Set-ADPUReadiness {
         }
         if ($a.PwdNeverExp) { $hints.Add((New-ADPUFinding 'PwdNeverExp' 'warn' 'password is set to never expire')) }
         if ($noPreAuth)     { $hints.Add((New-ADPUFinding 'NoPreAuth'   'warn' 'Kerberos pre-auth not required (AS-REP roastable)')) }
-        if ($disabled)      { $hints.Add((New-ADPUFinding 'Disabled'    'warn' 'account is disabled but still sits in an admin group - consider removing it')) }
+        if ($breakGlassAcct -and $isEnrolled) {
+            $hints.Add((New-ADPUFinding 'BreakGlassEnrolled' 'warn' ('{0} is enrolled - make sure at least one emergency admin account stays outside Protected Users' -f $(if ($isRid500) { 'the built-in Administrator (RID 500)' } else { 'this break-glass account' }))))
+        }
 
         # ---- coverage and confidence -------------------------------------------
         $coverGaps = [System.Collections.Generic.List[string]]::new()
@@ -1668,32 +1970,39 @@ function Set-ADPUReadiness {
             }
             # "Some controllers" is a gap too, not a pass: an account that only ever
             # authenticates against the unaudited one leaves no trace anywhere.
-            $partial = {
+            $partialGap = {
                 param([string]$What, $OnList, [string]$Missing)
                 $on = @($OnList).Count
                 if (-not $on)            { $coverGaps.Add("no controller had $What auditing on - $Missing") }
                 elseif ($on -lt $reach)  { $coverGaps.Add("only $on of $reach readable controller(s) had $What auditing on - $Missing on the rest") }
             }
-            & $partial 'Logon'                 $ix.LogonDcs   'NTLM aimed at a controller would not have been recorded'
-            & $partial 'Credential Validation' $ix.CredValDcs 'NTLM against member servers would not have been recorded'
-            & $partial 'Kerberos Authentication Service' $ix.KerbDcs 'DES/RC4 use and account key material would not have been recorded'
+            & $partialGap 'Logon'                 $ix.LogonDcs   'NTLM aimed at a controller would not have been recorded'
+            & $partialGap 'Credential Validation' $ix.CredValDcs 'NTLM against member servers would not have been recorded'
+            & $partialGap 'Kerberos Authentication Service' $ix.KerbDcs 'DES/RC4 use and account key material would not have been recorded'
             if (@($ix.KerbDcs).Count -and @($ix.NewFieldDcs).Count -lt $reach) {
                 $coverGaps.Add(('{0} of {1} readable controller(s) predate the newer 4768 fields (Server 2019+, or 2016 with the January 2025 update) - AES keys cannot be confirmed there and the DES/RC4 reading is weaker' -f
                                 ($reach - @($ix.NewFieldDcs).Count), $reach))
             }
+            if (@($ix.PartialDcs).Count) {
+                $coverGaps.Add(('{0} controller(s) were only partly read (row cap or a read error) - see the environment notes' -f @($ix.PartialDcs).Count))
+            }
         }
 
-        $fullCover = $ix -and @($ix.Dcs).Count -and -not @($ix.Unreachable).Count -and
+        $fullCover = [bool]($ix -and @($ix.Dcs).Count -and -not @($ix.Unreachable).Count -and
                      (@($ix.LogonDcs).Count -eq @($ix.Reachable).Count) -and
                      (@($ix.CredValDcs).Count -eq @($ix.Reachable).Count) -and
                      (@($ix.KerbDcs).Count -eq @($ix.Reachable).Count) -and
-                     (@($ix.NewFieldDcs).Count -eq @($ix.Reachable).Count)
+                     (@($ix.NewFieldDcs).Count -eq @($ix.Reachable).Count) -and
+                     -not @($ix.PartialDcs).Count)
 
         $blind = -not $ix -or (-not @($ix.LogonDcs).Count -and -not @($ix.CredValDcs).Count -and -not @($ix.KerbDcs).Count)
+        $active = [bool]($kerbRec -and [int]$kerbRec.Count -gt 0)
+        # A handful of days is not enough to call anything proven, however clean.
+        $longEnough = ($window -ge $minProven)
 
         $confidence =
             if ($outOfScope -or $blind) { 'Unknown' }
-            elseif ($fullCover -and $aesProven -and $kerbRec -and $kerbRec.Count -gt 0) { 'Proven' }
+            elseif ($fullCover -and $aesProven -and $active -and $longEnough) { 'Proven' }
             else { 'Plausible' }
 
         # ---- evidence, for the accounts that come back clear --------------------
@@ -1717,8 +2026,9 @@ function Set-ADPUReadiness {
             & $say 'AesUnknown' 'warn' 'password age unknown and no key material observed - AES keys are assumed, not proven'
         }
 
-        if ($null -eq $a.EncTypes) {
-            & $say 'Etypes' 'sub' 'msDS-SupportedEncryptionTypes is not set, so the account follows the domain default (AES)'
+        if ($null -eq $a.EncTypes -or [int]$a.EncTypes -eq 0) {
+            $shown = if ($null -eq $a.EncTypes) { 'is not set' } else { 'is 0' }
+            & $say 'Etypes' 'sub' ('msDS-SupportedEncryptionTypes {0}, so the account follows the domain default (AES)' -f $shown)
         } else {
             & $say 'Etypes' 'sub' ('msDS-SupportedEncryptionTypes = 0x{0:X}, which includes AES' -f [int]$a.EncTypes)
         }
@@ -1731,22 +2041,27 @@ function Set-ADPUReadiness {
             & $say 'Ntlm4624' 'warn' 'no controller in this domain had Logon auditing on - the NTLM check came back empty because it could not look'
         }
         if ($ix -and @($ix.CredValDcs).Count) {
-            & $say 'Ntlm4776' 'sub' ('no NTLM credential validation (4776) for this account name in the last {0} day(s) on {1} controller(s): {2}' -f $window, @($ix.CredValDcs).Count, (& $shorten $ix.CredValDcs))
+            & $say 'Ntlm4776' 'sub' ('no successful NTLM credential validation (4776) for this account name in the last {0} day(s) on {1} controller(s): {2}' -f $window, @($ix.CredValDcs).Count, (& $shorten $ix.CredValDcs))
         } else {
             & $say 'Ntlm4776' 'warn' 'no controller in this domain had Credential Validation auditing on - NTLM against member servers would not have been seen at all'
         }
         if ($ix -and @($ix.KerbDcs).Count) {
-            & $say 'WeakKerb' 'sub' ('no DES/RC4 Kerberos ticket (4768) for this SID in the last {0} day(s) on {1} controller(s): {2}' -f $window, @($ix.KerbDcs).Count, (& $shorten $ix.KerbDcs))
+            $how = if (@($ix.NewFieldDcs).Count -ge @($ix.KerbDcs).Count) { 'negotiated session key' } else { 'session key or, on older controllers, ticket' }
+            & $say 'WeakKerb' 'sub' ('no DES/RC4 {0} (4768) for this SID in the last {1} day(s) on {2} controller(s): {3}' -f $how, $window, @($ix.KerbDcs).Count, (& $shorten $ix.KerbDcs))
         } else {
             & $say 'WeakKerb' 'warn' 'no controller in this domain had Kerberos Authentication Service auditing on - the DES/RC4 check could not look'
         }
-        if ($kerbRec -and $kerbRec.Count -gt 0) {
+        if ($active) {
             & $say 'Activity' 'sub' ('the account did authenticate during the window ({0} Kerberos request(s), last {1:yyyy-MM-dd HH:mm}) - so a quiet result is a real result' -f $kerbRec.Count, $kerbRec.Last)
         } else {
             & $say 'Activity' 'warn' ('no authentication by this account was recorded in the last {0} day(s) - it may simply be idle, in which case the clean result proves very little' -f $window)
         }
         foreach ($g in $coverGaps) { & $say 'Coverage' 'warn' $g }
-        & $say 'Window' 'warn' ('the log window is {0} day(s) - anything older than that was not examined' -f $window)
+        if ($longEnough) {
+            & $say 'Window' 'warn' ('the log window is {0} day(s) - anything older than that was not examined' -f $window)
+        } else {
+            & $say 'Window' 'warn' ('the log window is only {0} day(s) - below {1} days nothing is rated "proven"; re-run with -Days {1} or more' -f $window, $minProven)
+        }
 
         # Out of scope is a third state, not a verdict: the account is privileged
         # in a reviewed domain but homed somewhere that was not reviewed, so
@@ -1754,10 +2069,15 @@ function Set-ADPUReadiness {
         if ($outOfScope) {
             $hints.Add((New-ADPUFinding 'OutOfScope' 'warn' ('homed in {0}, which was not part of this review - re-run with that domain in scope to judge it' -f $a.Domain)))
         }
-        $clearNow = ($blockers.Count -eq 0) -and (-not $isEnrolled) -and (-not $outOfScope)
+        # A break-glass account that is not enrolled is where it should be. It is
+        # neither clear (no enrolment command for it) nor blocked.
+        $reserved = $breakGlassAcct -and -not $isEnrolled
+        $clearNow = ($blockers.Count -eq 0) -and (-not $isEnrolled) -and (-not $outOfScope) -and (-not $reserved)
 
         $a | Add-Member -NotePropertyName OutOfScope  -NotePropertyValue $outOfScope  -Force
         $a | Add-Member -NotePropertyName Enrolled    -NotePropertyValue $isEnrolled  -Force
+        $a | Add-Member -NotePropertyName Reserved    -NotePropertyValue $reserved    -Force
+        $a | Add-Member -NotePropertyName BreakGlass  -NotePropertyValue $breakGlassAcct -Force
         $a | Add-Member -NotePropertyName Person      -NotePropertyValue $person      -Force
         $a | Add-Member -NotePropertyName HasSpn      -NotePropertyValue $hasSpn      -Force
         $a | Add-Member -NotePropertyName Disabled    -NotePropertyValue $disabled    -Force
@@ -1803,7 +2123,10 @@ function Get-ADPUSummary {
     $outside  = @($all | Where-Object { $_.OutOfScope })
     $inScope  = @($all | Where-Object { -not $_.OutOfScope })
     $enrolled = @($inScope | Where-Object { $_.Enrolled })
-    $pending  = @($inScope | Where-Object { -not $_.Enrolled })
+    # Break-glass accounts outside the group are where they belong: not pending,
+    # not blocked, and they do not move the exit code.
+    $reserved = @($inScope | Where-Object { -not $_.Enrolled -and $_.PSObject.Properties['Reserved'] -and $_.Reserved })
+    $pending  = @($inScope | Where-Object { -not $_.Enrolled -and -not ($_.PSObject.Properties['Reserved'] -and $_.Reserved) })
     $clear    = @($pending | Where-Object { $_.ClearNow })
     $blocked  = @($pending | Where-Object { -not $_.ClearNow })
     $dcs      = @($Topology.Controllers)
@@ -1822,6 +2145,10 @@ function Get-ADPUSummary {
         KerbUnknown    = @($reach | Where-Object { (& $state $_ 'KerbAS')  -eq 'Unknown' })
         CredValUnknown = @($reach | Where-Object { (& $state $_ 'CredVal') -eq 'Unknown' })
         OldKerb        = @($reach | Where-Object { $_.AuditKerbOk -and -not $_.NewKerbFields })
+        # Read, but not completely - row cap or a reader that failed half-way.
+        Partial        = @($reach | Where-Object {
+                             $_.PSObject.Properties['AuditPartial'] -and $_.AuditPartial -and
+                             ($_.AuditPartial['Logon'] -or $_.AuditPartial['KerbAS'] -or $_.AuditPartial['CredVal']) })
     }
     $gaps.AuditUnreadable = @($reach | Where-Object {
         (& $state $_ 'Logon') -eq 'Unknown' -and (& $state $_ 'KerbAS') -eq 'Unknown' -and (& $state $_ 'CredVal') -eq 'Unknown'
@@ -1836,7 +2163,7 @@ function Get-ADPUSummary {
     # left out, and an exit code of 2 would nag them about their own decision.
     $hasGaps = [bool]($gaps.Unreachable.Count -or $gaps.LogonOff.Count -or $gaps.KerbOff.Count -or
                       $gaps.CredValOff.Count -or $gaps.LogonUnknown.Count -or $gaps.KerbUnknown.Count -or
-                      $gaps.CredValUnknown.Count -or $outside.Count -or -not $dcs.Count)
+                      $gaps.CredValUnknown.Count -or $gaps.Partial.Count -or $outside.Count -or -not $dcs.Count)
 
     [pscustomobject]@{
         Total        = $all.Count
@@ -1845,6 +2172,7 @@ function Get-ADPUSummary {
         ExcludedForeign = [int]$Topology.ExcludedForeign
         StrictScope     = [bool]$Topology.StrictScope
         Enrolled     = $enrolled.Count
+        Reserved     = $reserved.Count
         Pending      = $pending.Count
         Clear        = $clear.Count
         Blocked      = $blocked.Count
@@ -1860,6 +2188,11 @@ function Get-ADPUSummary {
     }
 }
 
+# The machine's own domain, for the `net group /domain` fallback. Looked up once;
+# empty when this box is not domain-joined (or not on Windows at all).
+$script:ADPULocalDomain = $null
+try { $script:ADPULocalDomain = [string][DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain().Name } catch { }
+
 function Get-ADPUEnrolCommand {
     <#
         The RSAT form first, because it is the one people know - and a fallback
@@ -1869,13 +2202,27 @@ function Get-ADPUEnrolCommand {
         enrolling safely.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)] $Account)
+    param(
+        [Parameter(Mandatory)] $Account,
+        # The domain `net group /domain` actually reaches: the one of the machine
+        # it runs on. Defaults to this machine's domain.
+        [string]$LocalDomain = $script:ADPULocalDomain
+    )
 
     $sam = ([string]$Account.Sam) -replace "'", "''"
     $dom = ([string]$Account.Domain) -replace "'", "''"
+    # `net group ... /domain` always talks to the primary domain of the machine it
+    # runs on. For an account homed anywhere else it would fail - or worse, hit
+    # a same-named account in the wrong domain - so it is not offered as-is.
+    $local  = (-not $LocalDomain) -or ([string]$Account.Domain -ieq $LocalDomain)
+    $noRsat = if ($local) {
+        "net group ""Protected Users"" ""$([string]$Account.Sam)"" /add /domain"
+    } else {
+        "# $([string]$Account.Domain)\$([string]$Account.Sam): run  net group ""Protected Users"" ""$([string]$Account.Sam)"" /add /domain  on a machine joined to $([string]$Account.Domain)"
+    }
     [pscustomobject]@{
         Rsat     = "Add-ADGroupMember -Identity 'Protected Users' -Members '$sam' -Server '$dom'"
-        NoRsat   = "net group ""Protected Users"" ""$([string]$Account.Sam)"" /add /domain"
+        NoRsat   = $noRsat
         Rollback = "Remove-ADGroupMember -Identity 'Protected Users' -Members '$sam' -Server '$dom' -Confirm:`$false"
     }
 }
@@ -1916,6 +2263,9 @@ function Get-ADPUCoverageNotes {
 
     if (& $n $g.Unreachable) {
         & $add 'bad' ("{0} controller(s) could not be read at all - anything that only happened there is invisible to this review." -f (& $n $g.Unreachable))
+    }
+    if ($g.ContainsKey('Partial') -and (& $n $g.Partial)) {
+        & $add 'bad' ("{0} controller(s) were only partly read - the log harvest hit its row cap or the reader failed part-way. Findings from there are real, but a clean result is not; the per-controller notes say which source." -f (& $n $g.Partial))
     }
     if (& $n $g.AuditUnreadable) {
         & $add 'bad' ("{0} controller(s) would not report their audit policy at all - that is a rights or auditpol problem, not proof that auditing is off. Check the per-controller detail before changing any policy." -f (& $n $g.AuditUnreadable))
@@ -1997,8 +2347,10 @@ function Show-ADPUReadinessReport {
     $sorted  = @($Topology.Accounts | Sort-Object Domain, Sam)
     $outside = @($sorted | Where-Object { $_.OutOfScope })
     $inScope = @($sorted | Where-Object { -not $_.OutOfScope })
+    $isRes   = { param($x) [bool]($x.PSObject.Properties['Reserved'] -and $x.Reserved) }
+    $reserved = @($inScope | Where-Object { & $isRes $_ })
     $clear   = @($inScope | Where-Object { -not $_.Enrolled -and $_.ClearNow })
-    $blocked = @($inScope | Where-Object { -not $_.Enrolled -and -not $_.ClearNow })
+    $blocked = @($inScope | Where-Object { -not $_.Enrolled -and -not $_.ClearNow -and -not (& $isRes $_) })
     $already = @($inScope | Where-Object { $_.Enrolled })
     $window  = [int]$Topology.LookbackDays
 
@@ -2009,6 +2361,9 @@ function Show-ADPUReadinessReport {
     Write-ADPULine sub  ('Clear = no blocker found in the last {0} day(s) of the logs that could be read. Each verdict is itemised below.' -f $window)
     Write-ADPULine note ("{0} privileged account(s) in total." -f $s.Total)
     Write-ADPULine note ("{0} already enrolled, {1} still outside the group." -f $s.Enrolled, $s.Pending)
+    if ($s.Reserved) {
+        Write-ADPULine note ("{0} break-glass account(s) kept outside on purpose." -f $s.Reserved)
+    }
     Write-ADPULine note ("{0} of the {1} pending account(s) are clear to enrol right now." -f $s.Clear, $s.Pending)
     if ($s.Clear) {
         Write-ADPULine sub ("of those: {0} proven, {1} plausible, {2} unknown (the checks could not look)." -f $s.Proven, $s.Plausible, $s.Unknown)
@@ -2046,7 +2401,7 @@ function Show-ADPUReadinessReport {
         Write-ADPULine sub 'Enrolment commands (RSAT):'
         foreach ($a in $clear) { Write-ADPULine snippet (Get-ADPUEnrolCommand -Account $a).Rsat }
         Write-Host ''
-        Write-ADPULine sub 'Same thing without RSAT, if you are sitting on a controller:'
+        Write-ADPULine sub 'Same thing without RSAT (net group only reaches the domain of the machine it runs on):'
         foreach ($a in $clear) { Write-ADPULine snippet (Get-ADPUEnrolCommand -Account $a).NoRsat }
         Write-Host ''
         Write-ADPULine sub 'And the way back out, should a sign-in break:'
@@ -2069,6 +2424,18 @@ function Show-ADPUReadinessReport {
                 Write-ADPULine warn ('   ' + $h.Text)
             }
         }
+        Wait-ADPUEnter
+    }
+
+    # ===== 3b. Break-glass, kept outside on purpose ==========================
+    if ($reserved) {
+        Write-ADPULine head 'Kept outside on purpose (break-glass)'
+        Write-ADPULine sub  'Emergency admin accounts stay out of Protected Users, so an unforeseen side effect cannot lock out every administrator at once. The built-in Administrator (RID 500) always counts; -BreakGlass adds more.'
+        foreach ($a in $reserved) {
+            Write-ADPULine note (& $named $a)
+            foreach ($b in @($a.Blockers)) { Write-ADPULine sub ('   would also be blocked by: ' + $b.Text) }
+        }
+        Write-ADPULine tip 'Protect these another way: a long random password in a safe, no day-to-day use, and an alert on every logon.'
         Wait-ADPUEnter
     }
 
@@ -2268,10 +2635,15 @@ function Export-ADPUHtmlReport {
     $sorted   = @($Topology.Accounts | Sort-Object Domain, Sam)
     $outside  = @($sorted | Where-Object { $_.OutOfScope })
     $inScope  = @($sorted | Where-Object { -not $_.OutOfScope })
+    $isRes    = { param($x) [bool]($x.PSObject.Properties['Reserved'] -and $x.Reserved) }
+    $reserved = @($inScope | Where-Object { & $isRes $_ })
     $clear    = @($inScope | Where-Object { -not $_.Enrolled -and $_.ClearNow })
-    $blocked  = @($inScope | Where-Object { -not $_.Enrolled -and -not $_.ClearNow })
+    $blocked  = @($inScope | Where-Object { -not $_.Enrolled -and -not $_.ClearNow -and -not (& $isRes $_) })
     $already  = @($inScope | Where-Object { $_.Enrolled })
-    $hinted   = @($sorted | Where-Object { @($_.Hints).Count })
+    # In-scope only, as on the console: out-of-scope members have their own table
+    # (with their observations), and listing them twice contradicted the advice
+    # not to act on them here.
+    $hinted   = @($inScope | Where-Object { @($_.Hints).Count })
     $now      = if ($Topology.Generated) { $Topology.Generated } else { Get-Date }
 
     $css = @'
@@ -2382,7 +2754,7 @@ document.addEventListener('click',function(e){
 
         $blocks = @(
             @{ Id = 'cmd-rsat';     Title = 'Enrolment commands (RSAT)';         Sel = 'Rsat' }
-            @{ Id = 'cmd-norsat';   Title = 'Without RSAT, from a controller';   Sel = 'NoRsat' }
+            @{ Id = 'cmd-norsat';   Title = 'Without RSAT (reaches only the local machine&#39;s domain)';   Sel = 'NoRsat' }
             @{ Id = 'cmd-rollback'; Title = 'Rollback, if a sign-in breaks';     Sel = 'Rollback' }
         )
         foreach ($b in $blocks) {
@@ -2423,6 +2795,18 @@ document.addEventListener('click',function(e){
         & $add '</tbody></table></section>'
     } elseif ($s.ExcludedForeign) {
         & $add ('<section><p class="muted">{0} privileged member(s) homed in an unreviewed domain were left out of this report (-StrictScope).</p></section>' -f $s.ExcludedForeign)
+    }
+
+    if ($reserved.Count) {
+        & $add '<section><h2>Kept outside on purpose (break-glass)</h2>'
+        & $add '<p class="muted">Emergency admin accounts stay out of Protected Users, so an unforeseen side effect cannot lock out every administrator at once. The built-in Administrator (RID 500) always counts; -BreakGlass adds more.</p>'
+        & $add '<table><thead><tr><th>Domain</th><th>Account</th><th>Would also be blocked by</th></tr></thead><tbody>'
+        foreach ($a in $reserved) {
+            $items = @(foreach ($b in @($a.Blockers)) { '<li>{0}</li>' -f (& $enc $b.Text) })
+            & $add ('<tr><td>{0}</td><td>{1}</td><td><ul class="why">{2}</ul></td></tr>' -f
+                    (& $enc $a.Domain), (& $enc $a.Sam), ($items -join ''))
+        }
+        & $add '</tbody></table></section>'
     }
 
     & $add '<section><h2>Already enrolled</h2>'
@@ -2505,6 +2889,11 @@ document.addEventListener('click',function(e){
                         (& $auditCell 'CredVal'),
                         $(if ($dc.NewKerbFields) { 'ok' } else { 'warn' }),
                         $(if ($dc.NewKerbFields) { 'v2' } else { 'legacy' }))
+                $dcNotes = @($dc.Notes | Where-Object { $_ })
+                if ($dcNotes.Count) {
+                    & $add ('<tr><td></td><td colspan="5" class="muted" style="font-size:12px">{0}</td></tr>' -f
+                            ((@($dcNotes | ForEach-Object { 'note: ' + (& $enc $_) })) -join '<br>'))
+                }
             }
             & $add '</tbody></table>'
         }
@@ -2538,7 +2927,7 @@ function ConvertTo-ADPUResult {
 
     [pscustomobject]@{
         Tool      = 'ADPU-Analyzer'
-        Schema    = 2
+        Schema    = 3
         Generated = $Topology.Generated
         Forest    = $Topology.Forest.Name
         Scope     = $Topology.Scope
@@ -2547,7 +2936,7 @@ function ConvertTo-ADPUResult {
         Summary   = [pscustomobject]@{
             Total = $s.Total; InScope = $s.InScope; OutOfScope = $s.OutOfScope
             ExcludedForeign = $s.ExcludedForeign
-            Enrolled = $s.Enrolled; Pending = $s.Pending
+            Enrolled = $s.Enrolled; Reserved = $s.Reserved; Pending = $s.Pending
             Clear = $s.Clear; Blocked  = $s.Blocked
             Proven = $s.Proven; Plausible = $s.Plausible; Unknown = $s.Unknown
             HasCoverageGaps = $s.HasGaps
@@ -2570,6 +2959,7 @@ function ConvertTo-ADPUResult {
                 AuditCredentialValidation = $dc.AuditCredValOk
                 AuditState = $dc.AuditState; AuditReported = $dc.AuditRaw; AuditReadVia = $dc.AuditMethod
                 NewKerberosFields = $dc.NewKerbFields
+                PartlyRead = $dc.AuditPartial
                 KdcRc4Warnings = @($dc.KdcRc4 | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Count = $_.Count; Last = $_.Last } })
                 Notes = @($dc.Notes)
             }
@@ -2580,7 +2970,8 @@ function ConvertTo-ADPUResult {
                 DistinguishedName = $a.Dn; ObjectClass = $a.Class
                 PrivilegedVia = @($a.ViaGroups); PrivilegedIn = $a.FoundVia
                 OutOfScope = $a.OutOfScope
-                Enrolled = $a.Enrolled; Clear = $a.ClearNow; Confidence = $a.Confidence
+                Enrolled = $a.Enrolled; BreakGlass = $a.BreakGlass; Reserved = $a.Reserved
+                Clear = $a.ClearNow; Confidence = $a.Confidence
                 PasswordLastSet = $a.PwdLastSet; Enabled = $a.Enabled
                 AesKeysProven = $a.AesProven
                 Blockers = @($a.Blockers | ForEach-Object { [pscustomobject]@{ Code = $_.Code; Text = $_.Text } })
@@ -2622,7 +3013,7 @@ $span = [int64]$Days * 86400000
 function Read-Channel {
     param([string]$Log, [int[]]$Ids)
 
-    $out = [pscustomobject]@{ Log = $Log; Present = $false; Enabled = $false; Events = @() }
+    $out = [pscustomobject]@{ Log = $Log; Present = $false; Enabled = $false; Events = @(); ReadError = $null }
     try {
         $cfg = [Diagnostics.Eventing.Reader.EventLogConfiguration]::new($Log)
         $out.Present = $true
@@ -2657,7 +3048,12 @@ function Read-Channel {
             }
         )
     } catch {
-        # an empty channel throws rather than returning nothing - treat as none
+        # An empty result throws rather than returning nothing - that one really
+        # is "none". Anything else (access denied, a corrupt channel) is a read
+        # failure and must not be reported as a clean channel.
+        if ([string]$_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
+            $out.ReadError = $_.Exception.Message
+        }
     }
     $out
 }
@@ -2692,7 +3088,16 @@ function Invoke-ADPUVerification {
     Write-ADPULine sub  "Reads the Protected Users channels on each controller, covering the last $Days day(s)."
     Write-ADPULine sub  'Failures = an enrolled account still tried NTLM or DES/RC4. Successes = the group is working.'
 
-    $forest  = [DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
+    $forest  = Get-ADPUForest -DomainName $Domain -Credential $Credential
+    $known   = @($forest.Domains | ForEach-Object { [string]$_.Name })
+    if ($Domain) {
+        # Same rule as the readiness review: a name that is not in the forest is
+        # an error, not something to skip in silence.
+        $unknown = @($Domain | Where-Object { $n = $_; -not ($known | Where-Object { $_ -ieq $n }) })
+        if ($unknown.Count) {
+            throw ("Not a domain of forest {0}: {1}. Known domains: {2}" -f $forest.Name, ($unknown -join ', '), ($known -join ', '))
+        }
+    }
     $domains = if ($Domain) { @($forest.Domains | Where-Object { $Domain -contains [string]$_.Name }) } else { @($forest.Domains) }
     if (-not $domains) {
         Write-ADPULine bad 'No domain in scope is reachable.'
@@ -2701,7 +3106,7 @@ function Invoke-ADPUVerification {
 
     $targets = foreach ($d in $domains) {
         try {
-            $ctx = [DirectoryServices.ActiveDirectory.DirectoryContext]::new(0, [string]$d.Name)
+            $ctx = Get-ADPUDirectoryContext -Type Domain -Name ([string]$d.Name) -Credential $Credential
             foreach ($dc in @([DirectoryServices.ActiveDirectory.DomainController]::FindAll($ctx))) {
                 [pscustomobject]@{ Name = [string]$dc.Name; Domain = [string]$d.Name }
             }
@@ -2731,7 +3136,11 @@ function Invoke-ADPUVerification {
         $results  = Invoke-Command @splat -ErrorVariable problems
         [pscustomobject]@{
             Results = @($results)
-            Errors  = @($problems | ForEach-Object { [pscustomobject]@{ Computer = [string]$_.TargetObject; Message = $_.Exception.Message } })
+            Errors  = @($problems | ForEach-Object {
+                $who = [string]$_.TargetObject
+                if (-not $who -and $_.OriginInfo) { $who = [string]$_.OriginInfo.PSComputerName }
+                [pscustomobject]@{ Computer = $who; Message = $_.Exception.Message }
+            })
         }
     }
 
@@ -2746,6 +3155,8 @@ function Invoke-ADPUVerification {
         if (-not $n) { $n = [string]$r.Computer }
         if ($n) { $byName[$n] = $r }
     }
+    $why = @{}
+    foreach ($e in @($raw.Errors)) { if ($e.Computer -and -not $why.ContainsKey($e.Computer)) { $why[$e.Computer] = $e.Message } }
 
     $sawFailure = $false
     $sawSuccess = $false
@@ -2755,7 +3166,8 @@ function Invoke-ADPUVerification {
         Write-ADPULine note "Domain $d"
         foreach ($t in @($targets | Where-Object { $_.Domain -eq $d })) {
             if (-not $byName.ContainsKey($t.Name)) {
-                Write-ADPULine warn "   $($t.Name): could not be reached - skipped."
+                $reason = if ($why.ContainsKey($t.Name)) { $why[$t.Name] } else { 'no response' }
+                Write-ADPULine warn "   $($t.Name): could not be reached ($reason) - skipped."
                 $blindSpots++
                 continue
             }
@@ -2771,6 +3183,12 @@ function Invoke-ADPUVerification {
                 if (-not $ch.Enabled) {
                     Write-ADPULine warn "   $($t.Name): the $flavor channel is switched off - nothing was recorded."
                     Write-ADPULine snippet ("Invoke-Command -ComputerName '{0}' -ScriptBlock {{ wevtutil sl '{1}' /e:true }}" -f $t.Name, $ch.Log)
+                    $blindSpots++
+                    continue
+                }
+
+                if ($ch.PSObject.Properties['ReadError'] -and $ch.ReadError) {
+                    Write-ADPULine warn "   $($t.Name): the $flavor channel could not be read ($($ch.ReadError)) - no verdict from here."
                     $blindSpots++
                     continue
                 }
@@ -2853,6 +3271,7 @@ function Invoke-ADPUAnalyzer {
         [ValidateSet('Core','Extended')] [string]$Scope = 'Core',
         [string[]]$IncludeGroup,
         [switch]$StrictScope,
+        [string[]]$BreakGlass,
         [ValidateRange(1, 365)] [int]$Days = 7,
         [pscredential]$Credential,
         [string]$HtmlPath,
@@ -2862,86 +3281,93 @@ function Invoke-ADPUAnalyzer {
         [switch]$NonInteractive
     )
 
-    $script:ADPUNonInteractive = [bool]$NonInteractive
-    $script:ADPULastExitCode   = 3
-    if (-not $NonInteractive) { Show-ADPUBanner -Stamp (Get-Date -Format 'yyyy.MM.dd') }
+    try {
+        $script:ADPUNonInteractive = [bool]$NonInteractive
+        $script:ADPULastExitCode   = 3
+        if (-not $NonInteractive) { Show-ADPUBanner -Stamp (Get-Date -Format 'yyyy.MM.dd') }
 
-    $here = Get-ADPUHostContext
-    if ($here.IsDomainController -and -not $here.IsElevated) {
-        $relaunch = if ($Host.Name -eq 'Windows PowerShell ISE Host') {
-            'powershell_ise.exe'
-        } elseif ($Host.Version.Major -gt 6) {
-            'pwsh.exe'
-        } else {
-            'powershell.exe'
+        $here = Get-ADPUHostContext
+        if ($here.IsDomainController -and -not $here.IsElevated) {
+            $relaunch = if ($Host.Name -eq 'Windows PowerShell ISE Host') {
+                'powershell_ise.exe'
+            } elseif ($Host.Version.Major -gt 6) {
+                'pwsh.exe'
+            } else {
+                'powershell.exe'
+            }
+            throw "On a domain controller, ADPU-Analyzer needs administrator rights to read the local Security log. Close this window, relaunch $relaunch via right-click -> 'Run as Administrator', and run it again."
         }
-        throw "On a domain controller, ADPU-Analyzer needs administrator rights to read the local Security log. Close this window, relaunch $relaunch via right-click -> 'Run as Administrator', and run it again."
-    }
 
-    # Decide the scope. If -Domain was supplied, honour it. Otherwise discover the
-    # forest's domains and, when there is more than one, let the operator pick.
-    $picked = $Domain
-    if (-not $picked -and -not $NonInteractive) {
-        $forest = [DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
-        $names  = @($forest.Domains | ForEach-Object { [string]$_.Name } | Sort-Object)
-        if ($names.Count -gt 1) {
-            $sel = Read-ADPUMultiChoice 'Which domain(s) should I review?' $names
-            # Picking every domain is treated as "all" (keeps forest-wide admins in scope).
-            if (@($sel).Count -lt $names.Count) { $picked = @($sel) }
+        # Decide the scope. If -Domain was supplied, honour it. Otherwise discover the
+        # forest's domains and, when there is more than one, let the operator pick.
+        $picked = $Domain
+        if (-not $picked -and -not $NonInteractive) {
+            $forest = Get-ADPUForest -Credential $Credential
+            $names  = @($forest.Domains | ForEach-Object { [string]$_.Name } | Sort-Object)
+            if ($names.Count -gt 1) {
+                $sel = Read-ADPUMultiChoice 'Which domain(s) should I review?' $names
+                # Picking every domain is treated as "all" (keeps forest-wide admins in scope).
+                if (@($sel).Count -lt $names.Count) { $picked = @($sel) }
+            }
         }
-    }
 
-    # -Verify is the after-the-fact pass: no readiness sweep, just the operational
-    # logs for accounts that are already in the group.
-    if ($Verify) {
-        $script:ADPULastExitCode = [int](Invoke-ADPUVerification -Domain $picked -Days $Days -Credential $Credential)
+        # -Verify is the after-the-fact pass: no readiness sweep, just the operational
+        # logs for accounts that are already in the group.
+        if ($Verify) {
+            $script:ADPULastExitCode = [int](Invoke-ADPUVerification -Domain $picked -Days $Days -Credential $Credential)
+            Show-ADPUCredits
+            return
+        }
+
+        $topology = Get-ADPUTopology -DomainName $picked -Days $Days -Scope $Scope `
+                                     -IncludeGroup $IncludeGroup -StrictScope:$StrictScope -Credential $Credential
+        $topology | Add-Member -NotePropertyName BreakGlass -NotePropertyValue @($BreakGlass | Where-Object { $_ }) -Force
+        $null = Set-ADPUReadiness -Topology $topology
+
+        if (-not $NonInteractive) {
+            Write-ADPULine note 'Survey complete - rendering the report.'
+            Wait-ADPUEnter '   Press Enter to view the findings'
+            Write-Host
+        }
+        Show-ADPUReadinessReport -Topology $topology
+
+        # Optional HTML report: -HtmlPath writes silently; otherwise offer to save one.
+        $target = $HtmlPath
+        if (-not $target -and -not $NonInteractive) {
+            if (Read-ADPUYesNo 'Save an HTML report of these findings?') {
+                $suggest = Join-Path (Get-Location).Path ('ADPU-Analyzer-{0:yyyyMMdd-HHmmss}.html' -f (Get-Date))
+                $typed   = Read-ADPUAnswer "Path for the HTML file [$suggest]"
+                $target  = if ([string]::IsNullOrWhiteSpace($typed)) { $suggest } else { $typed }
+            }
+        }
+        if ($target) {
+            try {
+                Write-ADPULine good ("HTML report saved: {0}" -f (Export-ADPUHtmlReport -Topology $topology -Path $target))
+            } catch {
+                Write-ADPULine bad "Could not write the HTML report: $($_.Exception.Message)"
+            }
+        }
+        if ($JsonPath) {
+            try {
+                Write-ADPULine good ("JSON report saved: {0}" -f (Export-ADPUJsonReport -Topology $topology -Path $JsonPath))
+            } catch {
+                Write-ADPULine bad "Could not write the JSON report: $($_.Exception.Message)"
+            }
+        }
+
         Show-ADPUCredits
-        return
-    }
 
-    $topology = Get-ADPUTopology -DomainName $picked -Days $Days -Scope $Scope `
-                                 -IncludeGroup $IncludeGroup -StrictScope:$StrictScope -Credential $Credential
-    $null = Set-ADPUReadiness -Topology $topology
-
-    if (-not $NonInteractive) {
-        Write-ADPULine note 'Survey complete - rendering the report.'
-        Wait-ADPUEnter '   Press Enter to view the findings'
-        Write-Host
+        # The exit code travels on a script-scope variable rather than on the return
+        # value, so an interactive `Invoke-ADPUAnalyzer` does not dump an object into
+        # the console the moment the walkthrough ends.
+        $result = ConvertTo-ADPUResult -Topology $topology
+        $script:ADPULastExitCode = [int]$result.Summary.ExitCode
+        if ($PassThru) { $result }
+    } finally {
+        # Release the directory bindings only now, after every report has been
+        # written - the account objects stay readable only while they are open.
+        Clear-ADPUContextCache
     }
-    Show-ADPUReadinessReport -Topology $topology
-
-    # Optional HTML report: -HtmlPath writes silently; otherwise offer to save one.
-    $target = $HtmlPath
-    if (-not $target -and -not $NonInteractive) {
-        if (Read-ADPUYesNo 'Save an HTML report of these findings?') {
-            $suggest = Join-Path (Get-Location).Path ('ADPU-Analyzer-{0:yyyyMMdd-HHmmss}.html' -f (Get-Date))
-            $typed   = Read-ADPUAnswer "Path for the HTML file [$suggest]"
-            $target  = if ([string]::IsNullOrWhiteSpace($typed)) { $suggest } else { $typed }
-        }
-    }
-    if ($target) {
-        try {
-            Write-ADPULine good ("HTML report saved: {0}" -f (Export-ADPUHtmlReport -Topology $topology -Path $target))
-        } catch {
-            Write-ADPULine bad "Could not write the HTML report: $($_.Exception.Message)"
-        }
-    }
-    if ($JsonPath) {
-        try {
-            Write-ADPULine good ("JSON report saved: {0}" -f (Export-ADPUJsonReport -Topology $topology -Path $JsonPath))
-        } catch {
-            Write-ADPULine bad "Could not write the JSON report: $($_.Exception.Message)"
-        }
-    }
-
-    Show-ADPUCredits
-
-    # The exit code travels on a script-scope variable rather than on the return
-    # value, so an interactive `Invoke-ADPUAnalyzer` does not dump an object into
-    # the console the moment the walkthrough ends.
-    $result = ConvertTo-ADPUResult -Topology $topology
-    $script:ADPULastExitCode = [int]$result.Summary.ExitCode
-    if ($PassThru) { $result }
 }
 
 #  ----------------------------------------------------------------------------
@@ -2955,7 +3381,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     foreach ($k in $PSBoundParameters.Keys) {
         # Common parameters (-Verbose and friends) are not part of the function's
         # own signature and would break the splat.
-        if ($k -in @('Domain','Scope','IncludeGroup','StrictScope','Days','Credential','HtmlPath',
+        if ($k -in @('Domain','Scope','IncludeGroup','StrictScope','BreakGlass','Days','Credential','HtmlPath',
                      'JsonPath','Verify','PassThru','NonInteractive')) {
             $forward[$k] = $PSBoundParameters[$k]
         }

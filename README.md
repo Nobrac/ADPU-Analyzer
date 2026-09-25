@@ -67,21 +67,22 @@ Privileged accounts are the recursive membership of a group set, expanded across
 | Check | Source | Why it blocks |
 | --- | --- | --- |
 | **NTLM at a controller** | Security **4624**, `AuthenticationPackageName = NTLM` | Members cannot authenticate over NTLM at all. |
-| **NTLM anywhere in the estate** | Security **4776** (credential validation) | The case 4624 never sees: NTLM against a member server or workstation reaches the DC as 4776. |
+| **NTLM anywhere in the estate** | Security **4776** (credential validation), **successful** validations only | The case 4624 never sees: NTLM against a member server or workstation reaches the DC as 4776. Failed validations alone are a hint, not a blocker — they show someone *trying* NTLM with the name (a stale saved password, or a password spray), not a working dependency. |
 | **No AES key material** | **4768** → *Available Keys* | Direct evidence from the KDC that the account has no AES key. Beats every guess. |
 | **Password predates the group** | `pwdLastSet` vs. the group's `whenCreated` | Fallback for the above, used **only** when no key material was observed. |
-| **DES/RC4 Kerberos** | **4768** ticket / session encryption type | DES and RC4 pre-authentication are refused for members. |
+| **DES/RC4 Kerberos** | **4768** *Session Key Encryption Type* (newer controllers) — *Ticket Encryption Type* only as a fallback on older ones | DES and RC4 are refused for members. See [the krbtgt trap](#the-krbtgt-trap) for why the ticket field alone is weak evidence. |
 | **DES only** | `userAccountControl & 0x200000` | Forces exactly the cipher the group rejects. |
 | **No AES in the etype mask** | `msDS-SupportedEncryptionTypes` set, non-zero, without AES128/AES256 | Same result, configured on the account itself. Absent or `0` means the domain default (AES) and is fine. |
 | **Delegation configured** | `msDS-AllowedToDelegateTo`, UAC `0x1000000`, UAC `0x80000` | Members cannot delegate — constrained, protocol transition or unconstrained. Anything relying on it breaks. |
 | **Wrong account type** | `objectClass` | Computer, service and **gMSA** accounts must never be members — a gMSA gets its own hint pointing at authentication policy silos instead. |
+| **Disabled account** | `userAccountControl` | Enrolling a disabled admin achieves nothing — the fix is to take it out of the admin groups. |
 | **Group present & effective** | Domain functional level, DC operating systems | Below 2012 R2 DFL there are client-side protections only; without the group there is nothing to join. |
 
 The AD-derived checks come straight out of the directory, so unlike the log-based ones they are reliable even when auditing was switched off.
 
 ### Hardening hints — informational, never affect the verdict
 
-`adminCount=1` but not in Protected Users · a user account carrying an **SPN** (a service account in disguise) · *password never expires* · password over a year old · *no Kerberos pre-auth* (AS-REP roastable) · disabled accounts still sitting in admin groups.
+`adminCount=1` but not in Protected Users · a user account carrying an **SPN** (a service account in disguise) · *password never expires* · password over a year old · *no Kerberos pre-auth* (AS-REP roastable) · **failed** NTLM validations without a successful one (named by workstation) · Kerberos requests from a **client that offered no AES** (named by IP) · a break-glass account that *is* enrolled.
 
 ### Things no tool can clear you of
 
@@ -100,8 +101,8 @@ Every pending account lands in one of two lists, and **both are itemised** — t
 
 | Confidence | Meaning |
 | --- | --- |
-| **Proven** | AES key material was observed in the logs, the account really did authenticate inside the window, and every controller in its domain was fully audited and new enough to report the modern 4768 fields. |
-| **Plausible** | No blocker found, but nothing positively confirmed — typically a quiet account, or partial audit coverage. |
+| **Proven** | AES key material was observed in the logs, the account really did authenticate inside the window, every controller in its domain was fully audited, completely read and new enough to report the modern 4768 fields — and the window was at least **14 days**. |
+| **Plausible** | No blocker found, but nothing positively confirmed — typically a quiet account, partial audit coverage, a controller that was only partly read, or a window shorter than 14 days. |
 | **Unknown** | The checks could not look at all. A clean result here means nothing whatsoever. |
 
 > [!IMPORTANT]
@@ -123,11 +124,26 @@ If you only want the domain you picked and nothing else, `-StrictScope` drops th
 
 It is not the default, because a foreign account holding admin rights in your domain is usually something you want to know about. The report says how many were removed either way.
 
+### Break-glass accounts
+
+At least one emergency admin account should stay **outside** Protected Users, so that a side effect nobody foresaw cannot lock out every administrator at once. The built-in Administrator (RID 500) is always treated that way; `-BreakGlass` adds more:
+
+```powershell
+.\ADPU-Analyzer.ps1 -BreakGlass 'CORP\emergency', 'S-1-5-21-...-1190'
+```
+
+These accounts get their own section — neither *clear* (no enrolment command is printed for them) nor *blocked*, and they do not affect the exit code. If one of them is already enrolled, that is flagged as a hint.
+
 ### The krbtgt trap
 
-Historically, the *Ticket Encryption Type* in event 4768 was the encryption of the TGT itself — which the KDC picks from the **krbtgt** account's keys. A krbtgt without AES therefore makes *every* account in the domain look like an RC4 user. The tool checks krbtgt once per domain and, on controllers that still report the old field, downgrades that finding from a per-account blocker to a domain-wide warning: fix krbtgt first, then re-run.
+The *Ticket Encryption Type* in event 4768 is the encryption of the TGT itself — which the KDC picks from the **krbtgt** account's keys, on every build. It says nothing about the account that asked. A krbtgt without AES therefore makes *every* account in the domain look like an RC4 user, and a krbtgt with AES hides an account that really does negotiate RC4.
 
-Controllers running Server 2019+, or Server 2016 with the January 2025 cumulative update, report the **session key** in that field instead — which does reflect what the client negotiated, and is trustworthy. The report tells you which controllers are which.
+What the client and the KDC actually negotiated is in a separate field, *Session Key Encryption Type* (`SessionKeyEncryptionType`), which controllers running Server 2019+, or Server 2016 with the January 2025 cumulative update, report alongside `AccountAvailableKeys` and `ClientAdvertizedEncryptionTypes`. The tool uses:
+
+- **Newer controllers** — the session-key type decides. The ticket field is ignored.
+- **Older controllers** — the ticket field is all there is, so it is used as weaker evidence and reported as such (`WeakKerbLegacy`). If krbtgt permits no AES, it is downgraded to a domain-wide warning instead: fix krbtgt first, then re-run.
+
+Whether a controller reports the newer fields is read from its own event manifest and from the events themselves, per event — not inferred from an event version number. The report tells you which controllers are which.
 
 Only an **explicit, non-zero** `msDS-SupportedEncryptionTypes` without an AES bit counts as a krbtgt problem. Absent or `0` means nothing is configured and the KDC default applies, which includes AES from the 2008 functional level — that is the normal state of a healthy krbtgt, and flagging it would raise a false alarm in nearly every domain. The password age is reported alongside, because a krbtgt password that predates the functional-level raise has no AES keys no matter what the attribute says.
 
@@ -137,7 +153,7 @@ Only an **explicit, non-zero** `msDS-SupportedEncryptionTypes` without an AES bi
 
 - **Windows PowerShell 5.1+** or **PowerShell 7+**. No RSAT and no `ActiveDirectory` module needed — the script uses `System.DirectoryServices` directly.
 - Run on, or with line of sight to, a domain controller. **On a DC the session must be elevated**, since reading the local Security log requires it; the script refuses to continue otherwise.
-- **WinRM** reachable on the controllers — the log reads run through a single fan-out `Invoke-Command`, with a 20-second open timeout so one wedged controller cannot stall the review.
+- **WinRM** reachable on the controllers — the log reads run through a single fan-out `Invoke-Command`, with a 20-second open timeout so one wedged controller cannot stall the review. The operation timeout grows with `-Days` (15 minutes up to one hour).
 - An account allowed to read the Security log on every domain controller in scope. Pass `-Credential` to use a separate tier-0 account from an admin workstation.
 - Auditing enabled (see below). Without it the tool reports what it could not see rather than pretending the result is complete.
 
@@ -238,8 +254,9 @@ On a multi-domain forest the startup prompt lets you pick one, several, or all d
 | `-Scope Core\|Extended` | Which groups count as privileged. Default `Core`. |
 | `-IncludeGroup <string[]>` | Extra groups to fold in, by SID or by name. |
 | `-StrictScope` | Leave out privileged members homed in a domain that is not in scope. |
+| `-BreakGlass <string[]>` | Emergency admin accounts to keep outside the group on purpose — by SID, `sAMAccountName` or `DOMAIN\name`. The built-in Administrator (RID 500) always counts. |
 | `-Days <int>` | How far back the log harvest reaches. Default `7`. |
-| `-Credential <pscredential>` | Credentials for the directory and the remote log reads. |
+| `-Credential <pscredential>` | Credentials for forest and controller discovery, every directory read, and the remote log reads. From a machine outside the domain, also pass `-Domain`. |
 | `-HtmlPath <string>` | Write the self-contained HTML report here (skips the save prompt). |
 | `-JsonPath <string>` | Write the machine-readable result here. |
 | `-PassThru` | Emit the result object to the pipeline. |
@@ -263,7 +280,9 @@ The run returns a flat, serialisable result object and sets an exit code, so it 
 | `2` | No blockers, but the evidence has gaps (auditing off, controller unreachable). |
 | `3` | The run could not be completed. |
 
-The JSON carries the summary, every domain and controller with its audit state, and every account with its blockers and hints as stable `Code` values (`Ntlm4776`, `NoAesKeys`, `DelegatesOut`, …) — so a diff between two runs shows exactly what changed.
+The JSON (schema `3`) carries the summary, every domain and controller with its audit state and whether it was only partly read, and every account with its blockers and hints as stable `Code` values (`Ntlm4776`, `NoAesKeys`, `DelegatesOut`, `WeakKerb`, `WeakKerbLegacy`, `Disabled`, …) — so a diff between two runs shows exactly what changed.
+
+A controller whose log harvest hit the row cap or whose reader failed part-way counts as a coverage gap (exit code `2`): its findings are real, but its "nothing found" is not.
 
 ---
 
@@ -282,6 +301,8 @@ The readiness review looks backwards; `-Verify` is the other half. Once accounts
 | `…/ProtectedUser-Client` | `104`, `304` | Workstation — **not** covered by this run |
 
 (Full prefix: `Microsoft-Windows-Authentication/`.)
+
+A channel that exists and is switched on but cannot be read (access denied, a damaged log) is reported as a blind spot — never as "no failures".
 
 > [!CAUTION]
 > All three channels are **disabled by default**. A quiet result from a channel that was never switched on means nothing at all — the tool distinguishes the two and prints the command to enable it:
@@ -302,8 +323,9 @@ Invoke-Command -ComputerName 'DC01' -ScriptBlock {
 <br>
 
 - **Backward-looking evidence.** The log checks see only what the current Security logs still hold, and only on controllers that could be read. Log retention silently defines the observation window. The confidence column is the honest version of this: `Plausible` and `Unknown` both mean "no proof either way".
-- **4776 matches on the account name, not a SID.** The event carries no SID, so the match is by `sAMAccountName` within the account's own domain — unique there, but only there: the same name in a sibling domain is a different account, which is why out-of-scope members are never scored. A name containing an apostrophe cannot be expressed in an Event XPath filter and is skipped with a note.
-- **AES key evidence needs a recent controller.** *Available Keys* only appears on Server 2019+, or Server 2016 with the January 2025 cumulative update. Older controllers fall back to the `pwdLastSet` proxy, and the report says which ones.
+- **4776 matches on the account name, not a SID.** The event carries no SID, so the match is by `sAMAccountName` within the account's own domain — unique there, but only there: the same name in a sibling domain is a different account, which is why out-of-scope members are never scored. The name is recorded as the client typed it, so the filter asks for the stored spelling plus its lower- and upper-case forms; other mixed-case spellings may slip through. A name containing an apostrophe cannot be expressed in an Event XPath filter and is skipped with a note.
+- **AES key evidence needs a recent controller.** *Available Keys* and the session-key type only appear on Server 2019+, or Server 2016 with the January 2025 cumulative update. Older controllers fall back to the `pwdLastSet` proxy and the ticket field, and the report says which ones.
+- **The `net group` fallback only reaches the local domain.** `net group … /domain` talks to the domain of the machine it runs on, so for accounts homed elsewhere the report prints a note instead of the command. The RSAT command always targets the account's home domain.
 - **Password age is a proxy.** "Password predates the group" approximates "the account has no AES keys". It is used only when nothing better was observed. The precise trigger is the domain functional level being raised, not the group's creation.
 - **A quiet account proves little.** If an account did not authenticate at all during the window, the clean result says nothing about how it authenticates when it does. This is called out per account.
 - **Blind spots it cannot see at all:** Kerberos time skew, external trusts that do not support AES, cached/offline logons (they never reach a controller), non-domain-joined clients, and applications that hardcode NTLM.
@@ -320,25 +342,18 @@ The tool flags **known blockers** from the evidence available; it cannot guarant
 README.md                     this file
 LICENSE                       MIT
 ADPU-Analyzer.ps1             the whole tool (single file, read-only)
-tests/ADPU-Analyzer.Tests.ps1 unit tests - no AD needed, runs on Linux too
-tools/Invoke-ADPUAudit.ps1    static AST audit (see below)
-PSScriptAnalyzerSettings.psd1 lint configuration
-.github/workflows/ci.yml      the four check layers below, on every push
+tests/ADPU-Analyzer.Tests.ps1 unit tests - no AD, no Pester, runs on Linux too
 screenshots/                  image used in this README
 ```
 
-Four layers of checks run in CI, and each exists because its bug class shipped once:
-
-1. **Unit tests** — the scoring engine is a pure function over plain objects, so the whole decision table runs with synthetic input, including a "kitchen sink" topology that renders every report path with every account, controller and domain state at once.
-2. **The same tests under `Set-StrictMode -Version 3`** (`ADPU_STRICT=1`) — every exercised path then also fails on any reference to a property that does not exist, the class of typo no static check reliably sees.
-3. **A static AST audit** (`tools/Invoke-ADPUAudit.ps1`) over the script, both embedded remote sources and the tests: assignments to read-only automatic variables, calls passing parameters the target does not declare, `@()` wrapped around list-returning functions, calls to undefined commands, and a field-name contract between what the remote collector returns and what the topology reads. The audit itself is mutation-tested: reintroducing each historical bug makes it fail.
-4. **PSScriptAnalyzer** with a settings file in which every excluded rule carries its justification.
+The scoring engine is a pure function over plain objects, so the tests run the whole decision table on synthetic input — including a "kitchen sink" topology that renders the console, HTML and JSON reports with every account, controller and domain state at once. The helpers inside the remote collector (etype and key parsing, the `auditpol` CSV parser) are lifted out of its source text and tested on their own. The same tests also run under `Set-StrictMode -Version 3`, which turns any reference to a property that does not exist into a failure.
 
 ```powershell
 pwsh -File tests/ADPU-Analyzer.Tests.ps1
-ADPU_STRICT=1 pwsh -File tests/ADPU-Analyzer.Tests.ps1
-pwsh -File tools/Invoke-ADPUAudit.ps1
+$env:ADPU_STRICT = 1; pwsh -File tests/ADPU-Analyzer.Tests.ps1
 ```
+
+The exit code is the number of failed checks.
 
 ## License
 
