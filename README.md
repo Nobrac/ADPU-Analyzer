@@ -2,7 +2,7 @@
 
 # ADPU-Analyzer
 
-### Which privileged AD accounts can safely go into **Protected Users** — and which still need work first.
+### Checks which privileged AD accounts can go into Protected Users and which still need work first.
 
 ![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%2B%20%7C%207-5391FE?logo=powershell&logoColor=white)
 &nbsp;
@@ -16,14 +16,14 @@
 
 </div>
 
-*Protected Users* blocks NTLM, DES/RC4, delegation and credential caching for its members — with no per-account exceptions. Add an admin that still depends on any of that and its sign-in breaks. ADPU-Analyzer reads the directory and the domain controllers' event logs and tells you, per privileged account:
+*Protected Users* blocks NTLM, DES/RC4, delegation and credential caching for its members, with no per-account exceptions. An admin account that still depends on any of these can no longer sign in once it is added. ADPU-Analyzer reads the directory and the domain controllers' event logs and reports for each privileged account:
 
-- **clear to enrol** — with how strong the evidence is (*proven*, *plausible*, *unknown*)
-- **blocked** — and exactly why (NTLM use, no AES keys, RC4, delegation, running services or tasks, …)
-- **what it could not see** — auditing gaps, unreachable controllers
-- **whether it held** after enrolling (`-Verify`)
+- clear to enrol, with the strength of the evidence (*proven*, *plausible*, *unknown*)
+- blocked, and why (NTLM use, no AES keys, RC4, delegation, running services or tasks, …)
+- what it could not see (auditing gaps, unreachable controllers)
+- whether it held after enrolling (`-Verify`)
 
-It never changes anything. It prints the commands for you to run, including the rollback.
+It changes nothing. It prints the commands for you to run, including the rollback.
 
 ## Quick start
 
@@ -34,24 +34,22 @@ It never changes anything. It prints the commands for you to run, including the 
 .\ADPU-Analyzer.ps1 -Verify -Days 7                   # after enrolling
 ```
 
-Needs Windows PowerShell 5.1+ or PowerShell 7, WinRM to the domain controllers, rights to read their Security log, and **Logon**, **Kerberos Authentication Service** and **Credential Validation** auditing. No RSAT required.
+Requires Windows PowerShell 5.1+ or PowerShell 7, WinRM to the domain controllers, rights to read their Security log, and Logon, Kerberos Authentication Service and Credential Validation auditing. RSAT is not needed.
 
 > [!TIP]
-> Enrol one account first, confirm it still signs in end to end, then do the rest.
+> Enrol one account first and confirm it still signs in end to end before doing the rest.
 
 ## Documentation
 
-| | |
-| --- | --- |
-| [What it checks](docs/checks.md) | blockers, hints, and what no tool can clear you of |
-| [How the verdict works](docs/verdict.md) | confidence levels, scoping, break-glass accounts, the krbtgt trap |
-| [Setup & auditing](docs/setup.md) | requirements and the audit policy it needs |
-| [Usage](docs/usage.md) | all parameters, automation and exit codes, post-enrolment verification |
-| [Limitations](docs/limitations.md) | read this before you trust a green verdict |
-| [Development](docs/development.md) | repository layout and tests |
+- [What it checks](docs/checks.md): blockers, hints, and what no tool can clear you of
+- [How the verdict works](docs/verdict.md): confidence levels, scoping, break-glass accounts, the krbtgt trap
+- [Setup & auditing](docs/setup.md): requirements and the audit policy it needs
+- [Usage](docs/usage.md): all parameters, automation and exit codes, post-enrolment verification
+- [Limitations](docs/limitations.md): read this before you trust a green verdict
+- [Development](docs/development.md): repository layout and tests
 
 > [!NOTE]
-> **Built with AI assistance.** Parts of the code and documentation were written with Claude (Anthropic): I defined the requirements, reviewed the results and tested everything in a real Active Directory environment. Review it before running it in production.
+> Parts of the code and documentation were written with Claude (Anthropic). I defined the requirements, reviewed the results and tested everything in a real Active Directory environment. Review it before running it in production.
 
 ## License
 
